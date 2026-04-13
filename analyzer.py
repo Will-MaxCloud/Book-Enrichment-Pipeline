@@ -339,35 +339,67 @@ JSON:"""
 # ═══════════════════════════════════════════════════════════════════════════════
 
 class RateLimiter:
-    """Sliding-window rate limiter for async API calls.
+    """Sliding-window rate limiter tracking both RPM and TPM.
 
-    Tracks request timestamps in a deque. Before each request, drops
-    timestamps older than 60s and waits if we're at the RPM ceiling.
+    Anthropic enforces two independent limits: requests/minute AND
+    tokens/minute. Hitting either triggers a 429. This limiter tracks
+    both and waits (in a loop) until both constraints are satisfied.
+
+    Token estimates use chars/4 + overhead (~400 tokens for system
+    prompt + expected output), which is conservative enough to stay
+    safely under the ceiling.
     """
-    def __init__(self, max_rpm: int = 40):
+    def __init__(self, max_rpm: int = 50, max_tpm: int = 45000):
         self.max_rpm = max_rpm
-        self._timestamps: deque = deque()
-        self._lock = None  # Initialised lazily after event loop starts
+        self.max_tpm = max_tpm
+        self._request_times: deque = deque()       # timestamps of recent requests
+        self._token_log: deque = deque()            # (timestamp, token_count) pairs
+        self._lock = None  # Lazily initialised inside running event loop
 
-    async def acquire(self):
+    def _slide_window(self, now: float):
+        cutoff = now - 60.0
+        while self._request_times and self._request_times[0] < cutoff:
+            self._request_times.popleft()
+        while self._token_log and self._token_log[0][0] < cutoff:
+            self._token_log.popleft()
+
+    async def acquire(self, estimated_tokens: int = 3500):
+        """Block until both RPM and TPM headroom exists, then register the request."""
         import asyncio
         if self._lock is None:
             self._lock = asyncio.Lock()
         async with self._lock:
-            now = time.monotonic()
-            # Drop timestamps outside the 60-second window
-            while self._timestamps and now - self._timestamps[0] >= 60.0:
-                self._timestamps.popleft()
-            if len(self._timestamps) >= self.max_rpm:
-                wait = 60.0 - (now - self._timestamps[0])
-                if wait > 0:
-                    logger.debug(f"Rate limiter: waiting {wait:.1f}s (at {self.max_rpm} RPM)")
-                    await asyncio.sleep(wait)
-                # Re-drop after sleep
+            while True:
                 now = time.monotonic()
-                while self._timestamps and now - self._timestamps[0] >= 60.0:
-                    self._timestamps.popleft()
-            self._timestamps.append(time.monotonic())
+                self._slide_window(now)
+                current_rpm = len(self._request_times)
+                current_tpm = sum(t for _, t in self._token_log)
+
+                rpm_ok = current_rpm < self.max_rpm
+                tpm_ok = (current_tpm + estimated_tokens) <= self.max_tpm
+
+                if rpm_ok and tpm_ok:
+                    break
+
+                # Compute how long until the oldest event expires
+                waits = []
+                if not rpm_ok and self._request_times:
+                    waits.append(60.0 - (now - self._request_times[0]))
+                if not tpm_ok and self._token_log:
+                    waits.append(60.0 - (now - self._token_log[0][0]))
+                wait = max(min(waits) if waits else 1.0, 0.1)
+
+                constraint = "RPM" if not rpm_ok else "TPM"
+                logger.info(
+                    f"  ⏳ Rate limit ({constraint}): "
+                    f"{current_rpm}/{self.max_rpm} RPM, "
+                    f"{current_tpm:,}/{self.max_tpm:,} TPM — waiting {wait:.1f}s"
+                )
+                await asyncio.sleep(wait)
+
+            now = time.monotonic()
+            self._request_times.append(now)
+            self._token_log.append((now, estimated_tokens))
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -377,7 +409,7 @@ class RateLimiter:
 class AnalysisClient:
     def __init__(self, api_key, model="claude-sonnet-4-20250514",
                  p2_model=None, max_retries=3, retry_delay=2.0,
-                 max_concurrent=2, chunk_batch_size=1, rpm_limit=40):
+                 max_concurrent=2, chunk_batch_size=1, rpm_limit=50, tpm_limit=45000):
         self.api_key = api_key
         self.model = model
         self.p2_model = p2_model or model
@@ -385,6 +417,7 @@ class AnalysisClient:
         self.max_concurrent = max_concurrent
         self.chunk_batch_size = chunk_batch_size
         self.rpm_limit = rpm_limit
+        self.tpm_limit = tpm_limit
 
     # ── Core API calls (sync + async) ─────────────────────────────────────
 
@@ -499,7 +532,7 @@ class AnalysisClient:
         """
         import asyncio
         semaphore = asyncio.Semaphore(self.max_concurrent)
-        rate_limiter = RateLimiter(max_rpm=self.rpm_limit)
+        rate_limiter = RateLimiter(max_rpm=self.rpm_limit, max_tpm=self.tpm_limit)
         failed_chunks = []
 
         if slim and self.chunk_batch_size > 1:
@@ -511,8 +544,10 @@ class AnalysisClient:
             results = [None] * len(chunks)
 
             async def process_batch(batch):
+                # Estimate: chars/4 per chunk + 400 overhead (system prompt + output)
+                est_tokens = sum(len(c.text) // 4 for c in batch) + 400
                 async with semaphore:
-                    await rate_limiter.acquire()
+                    await rate_limiter.acquire(estimated_tokens=est_tokens)
                     try:
                         system, user = _build_slim_batch_prompt_cached(batch, book_context)
                         raw = await self._call_api_async(user, 512 * len(batch), system_prompt=system)
@@ -543,8 +578,9 @@ class AnalysisClient:
             results = [None] * len(chunks)
 
             async def process_chunk(i, chunk):
+                est_tokens = len(chunk.text) // 4 + 400
                 async with semaphore:
-                    await rate_limiter.acquire()
+                    await rate_limiter.acquire(estimated_tokens=est_tokens)
                     try:
                         if slim:
                             system, user = _build_slim_chunk_prompt_cached(chunk, book_context)

@@ -51,7 +51,8 @@ def analyze_book(
     fast_mode: bool = False,
     parallel: bool = False,
     chunk_batch_size: int = 1,
-    rpm_limit: int = 40,
+    rpm_limit: int = 50,
+    tpm_limit: int = 45000,
 ) -> BookAnalysis:
     """Full pipeline: PDF → Extract → Pass 1 → Pass 2 → JSON."""
     pdf_path = os.path.abspath(pdf_path)
@@ -85,7 +86,7 @@ def analyze_book(
 
     client = AnalysisClient(
         api_key=api_key, model=p1_model, p2_model=p2_model,
-        chunk_batch_size=chunk_batch_size, rpm_limit=rpm_limit,
+        chunk_batch_size=chunk_batch_size, rpm_limit=rpm_limit, tpm_limit=tpm_limit,
     )
 
     if fast_mode:
@@ -222,7 +223,8 @@ def batch_analyze(
     fast_mode: bool = False,
     parallel: bool = False,
     chunk_batch_size: int = 1,
-    rpm_limit: int = 40,
+    rpm_limit: int = 50,
+    tpm_limit: int = 45000,
 ) -> list[str]:
     pdf_files = sorted(
         list(Path(directory).glob("*.pdf")) +
@@ -244,7 +246,8 @@ def batch_analyze(
             analyze_book(str(pdf_path), api_key=api_key, output_dir=out,
                         p1_model=p1_model, p2_model=p2_model,
                         fast_mode=fast_mode, parallel=parallel,
-                        chunk_batch_size=chunk_batch_size, rpm_limit=rpm_limit)
+                        chunk_batch_size=chunk_batch_size,
+                        rpm_limit=rpm_limit, tpm_limit=tpm_limit)
             results.append(pdf_path.name)
         except Exception as e:
             logger.error(f"Failed: {pdf_path.name}: {e}")
@@ -277,8 +280,12 @@ def main():
         "--chunk-batch", type=int, default=1, metavar="N",
         help="Chunks per API call in fast+parallel mode (default: 1, recommended: 2)")
     parser.add_argument(
-        "--rpm-limit", type=int, default=40, metavar="N",
-        help="Max requests per minute in parallel mode (default: 40)")
+        "--rpm-limit", type=int, default=50, metavar="N",
+        help="Max requests per minute in parallel mode (default: 50)")
+    parser.add_argument(
+        "--tpm-limit", type=int, default=45000, metavar="N",
+        help="Max tokens per minute in parallel mode (default: 45000 for Haiku Tier 1; "
+             "set to 90000 for Tier 2, 180000 for Tier 3)")
     parser.add_argument(
         "--api-key",
         default=os.environ.get("ANTHROPIC_API_KEY"),
@@ -304,14 +311,14 @@ def main():
     if args.batch:
         batch_analyze(args.input, args.api_key, args.output,
                      p1_model, p2_model, args.fast, args.parallel,
-                     args.chunk_batch, args.rpm_limit)
+                     args.chunk_batch, args.rpm_limit, args.tpm_limit)
     else:
         if not os.path.isfile(args.input):
             logger.error(f"File not found: {args.input}")
             sys.exit(1)
         analyze_book(args.input, args.api_key, args.output,
                     p1_model, p2_model, args.fast, args.parallel,
-                    args.chunk_batch, args.rpm_limit)
+                    args.chunk_batch, args.rpm_limit, args.tpm_limit)
 
 
 if __name__ == "__main__":
