@@ -50,16 +50,13 @@ def analyze_book(
     p2_model: str = "claude-sonnet-4-20250514",
     fast_mode: bool = False,
     parallel: bool = False,
-    chunk_batch_size: int = 1,
-    rpm_limit: int = 50,
-    tpm_limit: int = 45000,
 ) -> BookAnalysis:
     """Full pipeline: PDF → Extract → Pass 1 → Pass 2 → JSON."""
     pdf_path = os.path.abspath(pdf_path)
     pdf_name = Path(pdf_path).stem
     start_time = time.time()
 
-    mode_label = ("FAST" if fast_mode else "QUALITY") + ("·PARALLEL" if parallel else "")
+    mode_label = "FAST" if fast_mode else "QUALITY"
     logger.info(f"{'═'*60}")
     logger.info(f"  ANALYZING [{mode_label}]: {pdf_name}")
     logger.info(f"  Pass 1: {p1_model.split('-')[1] if '-' in p1_model else p1_model}")
@@ -84,15 +81,14 @@ def analyze_book(
         f"{extraction.total_words:,} words, {extraction.total_pages} pages."
     )
 
-    client = AnalysisClient(
-        api_key=api_key, model=p1_model, p2_model=p2_model,
-        chunk_batch_size=chunk_batch_size, rpm_limit=rpm_limit, tpm_limit=tpm_limit,
-    )
+    client = AnalysisClient(api_key=api_key, model=p1_model, p2_model=p2_model)
 
-    if fast_mode:
-        result = _run_fast_pipeline(client, extraction, book_context, parallel)
+    if fast_mode and parallel:
+        result = _run_fast_pipeline_parallel(client, extraction, book_context)
+    elif fast_mode:
+        result = _run_fast_pipeline(client, extraction, book_context)
     else:
-        result = _run_quality_pipeline(client, extraction, book_context, parallel)
+        result = _run_quality_pipeline(client, extraction, book_context)
 
     # ── Save ──────────────────────────────────────────────────────────────
     if output_dir is None:
@@ -133,31 +129,25 @@ def analyze_book(
     return result
 
 
-def _run_quality_pipeline(client, extraction, book_context, parallel=False):
+def _run_quality_pipeline(client, extraction, book_context):
     """Full Pass 1 (all fields) + Pass 2."""
-    logger.info(f"STEP 2/4 · Pass 1 [QUALITY{'·PARALLEL' if parallel else ''}]: Analyzing {len(extraction.chunks)} chunks...")
+    logger.info(f"STEP 2/4 · Pass 1 [QUALITY]: Analyzing {len(extraction.chunks)} chunks...")
 
-    if parallel:
-        import asyncio
-        chunk_analyses, failed = asyncio.run(
-            client.analyze_chunks_parallel(extraction.chunks, book_context, slim=False))
-    else:
-        chunk_analyses = []
-        failed = []
-        for i, chunk in enumerate(extraction.chunks):
-            logger.info(f"  [{i+1}/{len(extraction.chunks)}] {chunk.label} ({chunk.word_count:,} words)")
-            try:
-                analysis = client.analyze_chunk(chunk, book_context)
-                logger.info(
-                    f"         → themes: {len(analysis.themes_detected)}, "
-                    f"chars: {len(analysis.characters_present)}, "
-                    f"humor: {analysis.humor_density}/10, violence: {analysis.violence_level}/10")
-                chunk_analyses.append(analysis)
-            except Exception as e:
-                logger.error(f"  ✗ Chunk {i} failed: {e}")
-                failed.append(i)
-            if i < len(extraction.chunks) - 1:
-                time.sleep(0.5)
+    chunk_analyses = []
+    failed = []
+
+    for i, chunk in enumerate(extraction.chunks):
+        logger.info(f"  [{i+1}/{len(extraction.chunks)}] {chunk.label} ({chunk.word_count:,} words)")
+        try:
+            analysis = client.analyze_chunk(chunk, book_context)
+            logger.info(
+                f"         → themes: {len(analysis.themes_detected)}, "
+                f"chars: {len(analysis.characters_present)}, "
+                f"humor: {analysis.humor_density}/10, violence: {analysis.violence_level}/10")
+            chunk_analyses.append(analysis)
+        except Exception as e:
+            logger.error(f"  ✗ Chunk {i} failed: {e}")
+            failed.append(i)
 
     if not chunk_analyses:
         logger.error("All chunks failed.")
@@ -173,36 +163,60 @@ def _run_quality_pipeline(client, extraction, book_context, parallel=False):
     return aggregate_analysis(chunk_analyses, holistic, extraction)
 
 
-def _run_fast_pipeline(client, extraction, book_context, parallel=False):
+def _run_fast_pipeline(client, extraction, book_context):
     """Slim Pass 1 (scores only, Haiku) + Rich Pass 2 (Sonnet)."""
-    logger.info(f"STEP 2/4 · Pass 1 [FAST{'·PARALLEL' if parallel else ''}]: Scoring {len(extraction.chunks)} chunks...")
+    logger.info(f"STEP 2/4 · Pass 1 [FAST]: Scoring {len(extraction.chunks)} chunks...")
 
-    if parallel:
-        import asyncio
-        slim_analyses, failed = asyncio.run(
-            client.analyze_chunks_parallel(extraction.chunks, book_context, slim=True))
-    else:
-        slim_analyses = []
-        failed = []
-        for i, chunk in enumerate(extraction.chunks):
-            logger.info(f"  [{i+1}/{len(extraction.chunks)}] {chunk.label} ({chunk.word_count:,} words)")
-            try:
-                analysis = client.analyze_chunk_slim(chunk, book_context)
-                logger.info(
-                    f"         → tone:{analysis.tone} pace:{analysis.pace} "
-                    f"violence:{analysis.violence} chars:{len(analysis.character_names)}")
-                slim_analyses.append(analysis)
-            except Exception as e:
-                logger.error(f"  ✗ Chunk {i} failed: {e}")
-                failed.append(i)
-            if i < len(extraction.chunks) - 1:
-                time.sleep(0.3)  # Shorter delay for faster model
+    slim_analyses = []
+    failed = []
+
+    for i, chunk in enumerate(extraction.chunks):
+        logger.info(f"  [{i+1}/{len(extraction.chunks)}] {chunk.label} ({chunk.word_count:,} words)")
+        try:
+            analysis = client.analyze_chunk_slim(chunk, book_context)
+            logger.info(
+                f"         → tone:{analysis.tone} pace:{analysis.pace} "
+                f"violence:{analysis.violence} chars:{len(analysis.character_names)}")
+            slim_analyses.append(analysis)
+        except Exception as e:
+            logger.error(f"  ✗ Chunk {i} failed: {e}")
+            failed.append(i)
 
     if not slim_analyses:
         logger.error("All chunks failed.")
         sys.exit(1)
     if failed:
         logger.warning(f"  {len(failed)} chunks failed — proceeding with {len(slim_analyses)}")
+
+    logger.info("STEP 3/4 · Pass 2 [FAST → SONNET]: Full analysis...")
+    holistic = client.analyze_holistic_fast(slim_analyses, extraction)
+    logger.info(f"  → Genre: {holistic.genre.value}")
+    logger.info(f"  → Themes: {len(holistic.ranked_themes)}")
+    logger.info(f"  → Characters: {len(holistic.ranked_characters)}")
+
+    logger.info("STEP 4/4 · Aggregating...")
+    return aggregate_analysis_fast(slim_analyses, holistic, extraction)
+
+
+def _run_fast_pipeline_parallel(client, extraction, book_context):
+    """Slim Pass 1 with 2-concurrent chunk processing, gated by rate limiter."""
+    import asyncio
+    logger.info(
+        f"STEP 2/4 · Pass 1 [FAST/PARALLEL]: Scoring "
+        f"{len(extraction.chunks)} chunks (2 concurrent, rate-limited)..."
+    )
+
+    slim_analyses, failed = asyncio.run(
+        client.analyze_chunks_parallel_fast(extraction.chunks, book_context, max_concurrent=2)
+    )
+
+    if not slim_analyses:
+        logger.error("All chunks failed.")
+        sys.exit(1)
+    if failed:
+        logger.warning(f"  {len(failed)} chunks failed — proceeding with {len(slim_analyses)}")
+    else:
+        logger.info(f"  ✓ All {len(slim_analyses)} chunks complete")
 
     logger.info("STEP 3/4 · Pass 2 [FAST → SONNET]: Full analysis...")
     holistic = client.analyze_holistic_fast(slim_analyses, extraction)
@@ -222,9 +236,6 @@ def batch_analyze(
     p2_model: str = "claude-sonnet-4-20250514",
     fast_mode: bool = False,
     parallel: bool = False,
-    chunk_batch_size: int = 1,
-    rpm_limit: int = 50,
-    tpm_limit: int = 45000,
 ) -> list[str]:
     pdf_files = sorted(
         list(Path(directory).glob("*.pdf")) +
@@ -234,7 +245,7 @@ def batch_analyze(
         logger.error(f"No PDF or EPUB files found in {directory}")
         return []
 
-    logger.info(f"Found {len(pdf_files)} files to analyze")
+    logger.info(f"Found {len(pdf_files)} books to analyze")
     out = output_dir or str(Path(directory) / "analysis_output")
     results: list[str] = []
 
@@ -245,12 +256,15 @@ def batch_analyze(
         try:
             analyze_book(str(pdf_path), api_key=api_key, output_dir=out,
                         p1_model=p1_model, p2_model=p2_model,
-                        fast_mode=fast_mode, parallel=parallel,
-                        chunk_batch_size=chunk_batch_size,
-                        rpm_limit=rpm_limit, tpm_limit=tpm_limit)
+                        fast_mode=fast_mode, parallel=parallel)
             results.append(pdf_path.name)
         except Exception as e:
             logger.error(f"Failed: {pdf_path.name}: {e}")
+
+        # Brief cooldown between books so the next book starts with headroom
+        if i < len(pdf_files) - 1:
+            logger.info("  Inter-book cooldown: 15s...")
+            time.sleep(15)
 
     logger.info(f"\nBatch complete: {len(results)}/{len(pdf_files)} succeeded")
     return results
@@ -266,7 +280,7 @@ def main():
     parser.add_argument("--fast", action="store_true",
         help="Fast mode: Haiku for Pass 1, Sonnet for Pass 2 (~10x cheaper)")
     parser.add_argument("--parallel", action="store_true",
-        help="Process chunks concurrently (~5x faster, no quality impact)")
+        help="Enable 2-concurrent chunk processing in fast mode (requires --fast)")
     parser.add_argument(
         "--p1-model", default=None,
         help="Pass 1 model (default: Sonnet, or Haiku in --fast mode)")
@@ -276,16 +290,6 @@ def main():
     parser.add_argument(
         "--model", "-m", default=None,
         help="Set both Pass 1 and Pass 2 to the same model (legacy flag)")
-    parser.add_argument(
-        "--chunk-batch", type=int, default=1, metavar="N",
-        help="Chunks per API call in fast+parallel mode (default: 1, recommended: 2)")
-    parser.add_argument(
-        "--rpm-limit", type=int, default=50, metavar="N",
-        help="Max requests per minute in parallel mode (default: 50)")
-    parser.add_argument(
-        "--tpm-limit", type=int, default=45000, metavar="N",
-        help="Max tokens per minute in parallel mode (default: 45000 for Haiku Tier 1; "
-             "set to 90000 for Tier 2, 180000 for Tier 3)")
     parser.add_argument(
         "--api-key",
         default=os.environ.get("ANTHROPIC_API_KEY"),
@@ -310,15 +314,13 @@ def main():
 
     if args.batch:
         batch_analyze(args.input, args.api_key, args.output,
-                     p1_model, p2_model, args.fast, args.parallel,
-                     args.chunk_batch, args.rpm_limit, args.tpm_limit)
+                     p1_model, p2_model, args.fast, args.parallel)
     else:
         if not os.path.isfile(args.input):
             logger.error(f"File not found: {args.input}")
             sys.exit(1)
         analyze_book(args.input, args.api_key, args.output,
-                    p1_model, p2_model, args.fast, args.parallel,
-                    args.chunk_batch, args.rpm_limit, args.tpm_limit)
+                    p1_model, p2_model, args.fast, args.parallel)
 
 
 if __name__ == "__main__":

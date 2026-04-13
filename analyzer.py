@@ -13,7 +13,6 @@ from __future__ import annotations
 import json
 import logging
 import time
-from collections import deque
 from typing import Any
 
 from schemas import (
@@ -37,87 +36,6 @@ logger = logging.getLogger(__name__)
 
 def _format_anchors(key: str) -> str:
     return "\n".join(f"  {s} = {d}" for s, d in SCORE_ANCHORS[key].items())
-
-def _build_chunk_prompt(chunk: TextChunk, book_context: str) -> str:
-    theme_list = "\n".join(f'  - "{t}"' for t in MASTER_THEMES)
-    archetype_values = ", ".join(f'"{a.value}"' for a in CharacterArchetype)
-    humor_values = ", ".join(f'"{h.value}"' for h in HumorType)
-    flag_values = ", ".join(f'"{f.value}"' for f in ContentFlag)
-
-    return f"""You are a literary analyst. Respond ONLY with valid JSON. No preamble, no markdown.
-
-CONTEXT: {book_context}
-SECTION: {chunk.label} (pages {chunk.page_start}-{chunk.page_end}, ~{chunk.word_count} words)
-
-═══ SCORING RUBRICS ═══
-TONE (1-10):
-{_format_anchors("tone")}
-READABILITY (1-10):
-{_format_anchors("readability")}
-VIOLENCE (1-10):
-{_format_anchors("violence")}
-PACE (1-10):
-{_format_anchors("pace")}
-WORLDBUILDING (1-10):
-{_format_anchors("worldbuilding")}
-HUMOR (1-10):
-{_format_anchors("humor")}
-ROMANCE (1-10):
-{_format_anchors("romance")}
-CHARACTER IMPORTANCE (1-10):
-{_format_anchors("character_importance")}
-THEME PROMINENCE (1-10):
-{_format_anchors("prominence")}
-
-═══ MASTER THEME LIST — pick from this list ONLY ═══
-{theme_list}
-
-═══ CONTENT FLAGS (content warnings ONLY) ═══
-{flag_values}
-"sexual_content" = consensual. "sexual_violence" = assault. These are DIFFERENT.
-
-═══ REQUIRED JSON ═══
-{{
-  "chunk_index": {chunk.index},
-  "chunk_label": "{chunk.label}",
-  "word_count": {chunk.word_count},
-  "themes_detected": ["theme from master list"],
-  "theme_prominences": {{"theme": int_1_to_10}},
-  "characters_present": [
-    {{
-      "name": "character's ACTUAL name (not generic descriptions)",
-      "role": "string",
-      "importance": int_1_to_10,
-      "gender": "male|female|non-binary|unknown",
-      "archetypes": [{archetype_values}],
-      "arc_summary": "1-2 sentences about what this character DOES in this section. NEVER leave empty.",
-      "age_category": "child|teen|young_adult|adult|elderly|ageless|null"
-    }}
-  ],
-  "humor_density": int_1_to_10,
-  "humor_types": [{humor_values}],
-  "tone": int_1_to_10,
-  "readability_score": int_1_to_10,
-  "violence_level": int_1_to_10,
-  "pace_score": int_1_to_10,
-  "romance_level": int_1_to_10,
-  "worldbuilding_level": int_1_to_10,
-  "content_flags": [{flag_values}],
-  "notable_observations": "string"
-}}
-
-RULES:
-- 2-8 themes from MASTER LIST ONLY.
-- Only named characters. Every character MUST have a real arc_summary (not empty, not generic).
-- Content flags are warnings only — not themes.
-
-TEXT:
----
-{chunk.text[:14000]}
----
-
-JSON:"""
-
 
 # ── Cached prompt builders (split static system / dynamic user) ───────────
 
@@ -187,40 +105,6 @@ JSON:"""
     return system, user
 
 
-def _build_slim_batch_prompt_cached(chunks, book_context):
-    """Returns (system_prompt, user_prompt) for analysing multiple chunks in one call.
-
-    The model returns a JSON ARRAY — one SlimChunkAnalysis object per section.
-    Sending N chunks per call reduces API call count by N× with negligible
-    quality risk (each section is clearly labelled and separated).
-    """
-    flag_values = ", ".join(f'"{f.value}"' for f in ContentFlag)
-
-    system = f"""Score text sections. Respond ONLY with JSON, no preamble.
-SCORING (1-10): tone (1=light, 10=dark), readability (1=hard, 10=easy),
-violence (1=none, 10=extreme), pace (1=slow, 10=fast), worldbuilding (1=none, 10=exhaustive),
-humor (1=none, 10=maximum), romance (1=none, 10=maximum).
-For each section return: chunk_index, chunk_label, word_count, tone, readability, violence,
-pace, worldbuilding, humor, romance (all int 1-10), character_names (list of named characters),
-content_flags (from [{flag_values}]), summary (one sentence).
-Analyse each section INDEPENDENTLY — do not let one section influence another's scores."""
-
-    sections = []
-    for i, chunk in enumerate(chunks):
-        sections.append(
-            f"SECTION {i + 1} (chunk_index={chunk.index}, label=\"{chunk.label}\", "
-            f"~{chunk.word_count} words):\n---\n{chunk.text[:14000]}\n---"
-        )
-
-    user = (
-        f"CONTEXT: {book_context}\n\n"
-        + "\n\n".join(sections)
-        + f"\n\nReturn a JSON ARRAY with exactly {len(chunks)} objects, "
-        "one per section in order:\n[{{...}}, {{...}}]\nJSON:"
-    )
-    return system, user
-
-
 def _build_holistic_prompt(chunk_analyses, extraction):
     chunk_summaries = []
     for ca in chunk_analyses:
@@ -266,10 +150,10 @@ TOTAL: {extraction.total_words:,} words, {extraction.total_pages} pages
 {_format_anchors("age_target")}
 
 ═══ OPENING TEXT ═══
-{extraction.opening_text[:6000]}
+{extraction.opening_text}
 
 ═══ CLOSING TEXT ═══
-{extraction.closing_text[:6000]}
+{extraction.closing_text}
 
 ═══ SECTION SPINE ═══
 {chunk_spine}
@@ -335,100 +219,40 @@ JSON:"""
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# RATE LIMITER
-# ═══════════════════════════════════════════════════════════════════════════════
-
-class RateLimiter:
-    """Sliding-window rate limiter tracking both RPM and TPM.
-
-    Anthropic enforces two independent limits: requests/minute AND
-    tokens/minute. Hitting either triggers a 429. This limiter tracks
-    both and waits (in a loop) until both constraints are satisfied.
-
-    Token estimates use chars/4 + overhead (~400 tokens for system
-    prompt + expected output), which is conservative enough to stay
-    safely under the ceiling.
-    """
-    def __init__(self, max_rpm: int = 50, max_tpm: int = 45000):
-        self.max_rpm = max_rpm
-        self.max_tpm = max_tpm
-        self._request_times: deque = deque()       # timestamps of recent requests
-        self._token_log: deque = deque()            # (timestamp, token_count) pairs
-        self._lock = None  # Lazily initialised inside running event loop
-
-    def _slide_window(self, now: float):
-        cutoff = now - 60.0
-        while self._request_times and self._request_times[0] < cutoff:
-            self._request_times.popleft()
-        while self._token_log and self._token_log[0][0] < cutoff:
-            self._token_log.popleft()
-
-    async def acquire(self, estimated_tokens: int = 3500):
-        """Block until both RPM and TPM headroom exists, then register the request."""
-        import asyncio
-        if self._lock is None:
-            self._lock = asyncio.Lock()
-        async with self._lock:
-            while True:
-                now = time.monotonic()
-                self._slide_window(now)
-                current_rpm = len(self._request_times)
-                current_tpm = sum(t for _, t in self._token_log)
-
-                rpm_ok = current_rpm < self.max_rpm
-                tpm_ok = (current_tpm + estimated_tokens) <= self.max_tpm
-
-                if rpm_ok and tpm_ok:
-                    break
-
-                # Compute how long until the oldest event expires
-                waits = []
-                if not rpm_ok and self._request_times:
-                    waits.append(60.0 - (now - self._request_times[0]))
-                if not tpm_ok and self._token_log:
-                    waits.append(60.0 - (now - self._token_log[0][0]))
-                wait = max(min(waits) if waits else 1.0, 0.1)
-
-                constraint = "RPM" if not rpm_ok else "TPM"
-                logger.info(
-                    f"  ⏳ Rate limit ({constraint}): "
-                    f"{current_rpm}/{self.max_rpm} RPM, "
-                    f"{current_tpm:,}/{self.max_tpm:,} TPM — waiting {wait:.1f}s"
-                )
-                await asyncio.sleep(wait)
-
-            now = time.monotonic()
-            self._request_times.append(now)
-            self._token_log.append((now, estimated_tokens))
-
-
-# ═══════════════════════════════════════════════════════════════════════════════
 # API CLIENT
 # ═══════════════════════════════════════════════════════════════════════════════
 
 class AnalysisClient:
+    # Token estimates per call type (conservative upper bounds)
+    _TOKENS_SLIM_CHUNK = 3_100    # Haiku Pass 1 slim
+    _TOKENS_FULL_CHUNK = 5_000    # Sonnet Pass 1 full
+    _TOKENS_HOLISTIC_FAST = 9_200  # Sonnet Pass 2 fast
+    _TOKENS_HOLISTIC_FULL = 11_000 # Sonnet Pass 2 quality
+
     def __init__(self, api_key, model="claude-sonnet-4-20250514",
                  p2_model=None, max_retries=3, retry_delay=2.0,
-                 max_concurrent=2, chunk_batch_size=1, rpm_limit=50, tpm_limit=45000):
+                 rpm_limit=50, tpm_limit=50_000):
+        import anthropic
+        from ratelimiter import RollingRateLimiter
         self.api_key = api_key
         self.model = model
         self.p2_model = p2_model or model
         self.max_retries, self.retry_delay = max_retries, retry_delay
-        self.max_concurrent = max_concurrent
-        self.chunk_batch_size = chunk_batch_size
-        self.rpm_limit = rpm_limit
-        self.tpm_limit = tpm_limit
+        self.client = anthropic.Anthropic(api_key=api_key)
+        self.async_client = anthropic.AsyncAnthropic(api_key=api_key)
+        self.rate_limiter = RollingRateLimiter(rpm_limit=rpm_limit, tpm_limit=tpm_limit)
 
     # ── Core API calls (sync + async) ─────────────────────────────────────
 
     def _call_api(self, prompt, max_tokens=4096, model_override=None,
-                  system_prompt=None):
-        """Sync API call. If system_prompt provided, enables prompt caching."""
+                  system_prompt=None, estimated_tokens=None):
+        """Sync API call with rate limiting and prompt caching."""
         import anthropic
-        client = anthropic.Anthropic(api_key=self.api_key)
         use_model = model_override or self.model
+        est = estimated_tokens or self._TOKENS_FULL_CHUNK
 
-        # Build request kwargs
+        self.rate_limiter.wait_if_needed(est)
+
         kwargs = {
             "model": use_model,
             "max_tokens": max_tokens,
@@ -436,7 +260,6 @@ class AnalysisClient:
             "messages": [{"role": "user", "content": prompt}],
         }
 
-        # Add cached system prompt if provided
         if system_prompt:
             kwargs["system"] = [{
                 "type": "text",
@@ -446,7 +269,7 @@ class AnalysisClient:
 
         for attempt in range(1, self.max_retries + 1):
             try:
-                r = client.messages.create(**kwargs)
+                r = self.client.messages.create(**kwargs)
                 return "".join(b.text for b in r.content if b.type == "text").strip()
             except anthropic.RateLimitError:
                 w = self.retry_delay * (2 ** (attempt - 1))
@@ -459,12 +282,16 @@ class AnalysisClient:
         raise RuntimeError(f"Failed after {self.max_retries} retries")
 
     async def _call_api_async(self, prompt, max_tokens=4096, model_override=None,
-                               system_prompt=None):
-        """Async API call with prompt caching support."""
+                               system_prompt=None, estimated_tokens=None):
+        """Async API call with rate limiting and prompt caching."""
         import anthropic
         import asyncio
-        client = anthropic.AsyncAnthropic(api_key=self.api_key)
         use_model = model_override or self.model
+        est = estimated_tokens or self._TOKENS_FULL_CHUNK
+
+        # Rate limiter is sync but thread-safe; run in executor to avoid blocking event loop
+        loop = asyncio.get_event_loop()
+        await loop.run_in_executor(None, self.rate_limiter.wait_if_needed, est)
 
         kwargs = {
             "model": use_model,
@@ -482,7 +309,7 @@ class AnalysisClient:
 
         for attempt in range(1, self.max_retries + 1):
             try:
-                r = await client.messages.create(**kwargs)
+                r = await self.async_client.messages.create(**kwargs)
                 return "".join(b.text for b in r.content if b.type == "text").strip()
             except anthropic.RateLimitError:
                 w = self.retry_delay * (2 ** (attempt - 1))
@@ -499,109 +326,62 @@ class AnalysisClient:
     def analyze_chunk(self, chunk, book_context):
         system, user = _build_chunk_prompt_cached(chunk, book_context)
         return ChunkAnalysis(**_sanitize_chunk_data(
-            _safe_parse_json(self._call_api(user, system_prompt=system))))
+            _safe_parse_json(self._call_api(
+                user, system_prompt=system,
+                estimated_tokens=self._TOKENS_FULL_CHUNK))))
 
     def analyze_holistic(self, chunk_analyses, extraction):
         return HolisticAnalysis(**_sanitize_holistic_data(
             _safe_parse_json(self._call_api(
                 _build_holistic_prompt(chunk_analyses, extraction), 4096,
-                model_override=self.p2_model))))
+                model_override=self.p2_model,
+                estimated_tokens=self._TOKENS_HOLISTIC_FULL))))
 
     # ── Fast mode (sync) ──────────────────────────────────────────────────
 
     def analyze_chunk_slim(self, chunk, book_context):
         system, user = _build_slim_chunk_prompt_cached(chunk, book_context)
         return SlimChunkAnalysis(**_sanitize_slim_chunk_data(
-            _safe_parse_json(self._call_api(user, 512, system_prompt=system))))
+            _safe_parse_json(self._call_api(
+                user, 512, system_prompt=system,
+                estimated_tokens=self._TOKENS_SLIM_CHUNK))))
 
     def analyze_holistic_fast(self, slim_analyses, extraction):
         return HolisticAnalysis(**_sanitize_holistic_data(
             _safe_parse_json(self._call_api(
                 _build_fast_holistic_prompt(slim_analyses, extraction), 4096,
-                model_override=self.p2_model))))
+                model_override=self.p2_model,
+                estimated_tokens=self._TOKENS_HOLISTIC_FAST))))
 
-    # ── Parallel chunk processing ─────────────────────────────────────────
+    # ── Parallel fast-mode chunk processing ──────────────────────────────
 
-    async def analyze_chunks_parallel(self, chunks, book_context, slim=False):
+    async def analyze_chunks_parallel_fast(self, chunks, book_context, max_concurrent=2):
         """
-        Process chunks concurrently with rate-aware safety controls:
-        - Max `max_concurrent` requests in flight (semaphore)
-        - Sliding-window rate limiter (default 40 RPM) prevents 429 errors
-        - If chunk_batch_size > 1 and slim=True: groups chunks into batches,
-          halving/thirding call count and RPM pressure
+        Process slim chunks with bounded concurrency (default 2).
+        The rate limiter gates actual throughput — the semaphore is a hard ceiling.
+        Safe for Tier 1 API limits.
         """
         import asyncio
-        semaphore = asyncio.Semaphore(self.max_concurrent)
-        rate_limiter = RateLimiter(max_rpm=self.rpm_limit, max_tpm=self.tpm_limit)
-        failed_chunks = []
+        semaphore = asyncio.Semaphore(max_concurrent)
+        results = [None] * len(chunks)
+        failed = []
 
-        if slim and self.chunk_batch_size > 1:
-            # ── Batched slim mode ─────────────────────────────────────────
-            batches = [
-                chunks[i:i + self.chunk_batch_size]
-                for i in range(0, len(chunks), self.chunk_batch_size)
-            ]
-            results = [None] * len(chunks)
+        async def process_chunk(i, chunk):
+            async with semaphore:
+                try:
+                    system, user = _build_slim_chunk_prompt_cached(chunk, book_context)
+                    raw = await self._call_api_async(
+                        user, 512, system_prompt=system,
+                        estimated_tokens=self._TOKENS_SLIM_CHUNK)
+                    results[i] = SlimChunkAnalysis(**_sanitize_slim_chunk_data(
+                        _safe_parse_json(raw)))
+                    logger.info(f"  ✓ Chunk {i+1}/{len(chunks)} complete")
+                except Exception as e:
+                    logger.error(f"  ✗ Chunk {i+1} failed: {e}")
+                    failed.append(i)
 
-            async def process_batch(batch):
-                # Estimate: chars/4 per chunk + 400 overhead (system prompt + output)
-                est_tokens = sum(len(c.text) // 4 for c in batch) + 400
-                async with semaphore:
-                    await rate_limiter.acquire(estimated_tokens=est_tokens)
-                    try:
-                        system, user = _build_slim_batch_prompt_cached(batch, book_context)
-                        raw = await self._call_api_async(user, 512 * len(batch), system_prompt=system)
-                        parsed = _safe_parse_json(raw)
-                        # Response must be a list; if model returned a single dict, wrap it
-                        if isinstance(parsed, dict):
-                            parsed = [parsed]
-                        for j, item in enumerate(parsed):
-                            if j < len(batch):
-                                chunk = batch[j]
-                                item.setdefault("chunk_index", chunk.index)
-                                item.setdefault("chunk_label", chunk.label)
-                                item.setdefault("word_count", chunk.word_count)
-                                results[chunk.index] = SlimChunkAnalysis(
-                                    **_sanitize_slim_chunk_data(item))
-                        labels = ", ".join(c.label for c in batch)
-                        logger.info(f"  ✓ Batch complete: {labels}")
-                    except Exception as e:
-                        logger.error(f"  ✗ Batch failed ({[c.label for c in batch]}): {e}")
-                        for chunk in batch:
-                            failed_chunks.append(chunk.index)
-
-            tasks = [asyncio.create_task(process_batch(b)) for b in batches]
-            await asyncio.gather(*tasks)
-
-        else:
-            # ── Single-chunk mode (slim or quality) ───────────────────────
-            results = [None] * len(chunks)
-
-            async def process_chunk(i, chunk):
-                est_tokens = len(chunk.text) // 4 + 400
-                async with semaphore:
-                    await rate_limiter.acquire(estimated_tokens=est_tokens)
-                    try:
-                        if slim:
-                            system, user = _build_slim_chunk_prompt_cached(chunk, book_context)
-                            raw = await self._call_api_async(user, 512, system_prompt=system)
-                            results[i] = SlimChunkAnalysis(**_sanitize_slim_chunk_data(
-                                _safe_parse_json(raw)))
-                        else:
-                            system, user = _build_chunk_prompt_cached(chunk, book_context)
-                            raw = await self._call_api_async(user, system_prompt=system)
-                            results[i] = ChunkAnalysis(**_sanitize_chunk_data(
-                                _safe_parse_json(raw)))
-                        logger.info(f"  ✓ Chunk {i+1}/{len(chunks)} complete")
-                    except Exception as e:
-                        logger.error(f"  ✗ Chunk {i} failed: {e}")
-                        failed_chunks.append(i)
-
-            tasks = [asyncio.create_task(process_chunk(i, c)) for i, c in enumerate(chunks)]
-            await asyncio.gather(*tasks)
-
-        successful = [r for r in results if r is not None]
-        return successful, failed_chunks
+        await asyncio.gather(*[process_chunk(i, c) for i, c in enumerate(chunks)])
+        return [r for r in results if r is not None], failed
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -1458,49 +1238,6 @@ def _aggregate_characters_for_prompt(chunks):
 # FAST MODE — Slim Pass 1 (Haiku) + Rich Pass 2 (Sonnet)
 # ═══════════════════════════════════════════════════════════════════════════════
 
-def _build_slim_chunk_prompt(chunk, book_context):
-    """Tiny prompt for Haiku — just scores, names, flags, summary."""
-    flag_values = ", ".join(f'"{f.value}"' for f in ContentFlag)
-
-    return f"""Score this text section. Respond ONLY with JSON, no preamble.
-
-CONTEXT: {book_context}
-SECTION: {chunk.label} (~{chunk.word_count} words)
-
-SCORING (1-10):
-  tone: 1=light/cheerful, 5=balanced, 10=extremely dark/bleak
-  readability: 1=very hard/dense, 5=average, 10=effortless/simple
-  violence: 1=none, 5=moderate fights, 10=extreme gore
-  pace: 1=very slow, 5=moderate, 10=relentless action
-  worldbuilding: 1=no setting detail, 5=moderate, 10=exhaustive
-  humor: 1=none, 5=regular comedy, 10=maximum comedy
-  romance: 1=none, 5=notable romance, 10=love story is everything
-
-JSON:
-{{
-  "chunk_index": {chunk.index},
-  "chunk_label": "{chunk.label}",
-  "word_count": {chunk.word_count},
-  "tone": int,
-  "readability": int,
-  "violence": int,
-  "pace": int,
-  "worldbuilding": int,
-  "humor": int,
-  "romance": int,
-  "character_names": ["list every named character who appears"],
-  "content_flags": [{flag_values}],
-  "summary": "One sentence summary of what happens in this section."
-}}
-
-TEXT:
----
-{chunk.text[:14000]}
----
-
-JSON:"""
-
-
 def _sanitize_slim_chunk_data(data):
     """Sanitize slim chunk data."""
     for f in ["tone", "readability", "violence", "pace",
@@ -1575,10 +1312,10 @@ TOTAL: {extraction.total_words:,} words, {extraction.total_pages} pages
 {_format_anchors("age_target")}
 
 ═══ OPENING TEXT ═══
-{extraction.opening_text[:6000]}
+{extraction.opening_text}
 
 ═══ CLOSING TEXT ═══
-{extraction.closing_text[:6000]}
+{extraction.closing_text}
 
 ═══ SECTION SPINE ═══
 {chunk_spine}
@@ -1768,16 +1505,13 @@ def aggregate_analysis_fast(slim_analyses, holistic, extraction):
         humor_density=ratings.humor,
         primary_humor_types=holistic.humor_types if holistic.humor_types else [HumorType.NONE])
 
-    # Content flags: union from chunks, but capped at 4 by Pass 2
+    # Content flags: union of Pass 1 slim chunk flags + Pass 2 flags, capped at 4
     flags = set()
     for sa in slim_analyses:
         flags.update(sa.content_flags)
     flags.update(holistic.content_flags)
     flags.discard(ContentFlag.NONE)
-    # Use Pass 2's flags as the curated top 4
-    p2_flags = set(holistic.content_flags)
-    p2_flags.discard(ContentFlag.NONE)
-    cflags = sorted(p2_flags, key=lambda f: f.value)[:4] or [ContentFlag.NONE]
+    cflags = sorted(flags, key=lambda f: f.value)[:4] or [ContentFlag.NONE]
 
     return BookAnalysis(
         metadata=metadata, themes=themes,
