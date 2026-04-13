@@ -239,7 +239,6 @@ class AnalysisClient:
         self.p2_model = p2_model or model
         self.max_retries, self.retry_delay = max_retries, retry_delay
         self.client = anthropic.Anthropic(api_key=api_key)
-        self.async_client = anthropic.AsyncAnthropic(api_key=api_key)
         self.rate_limiter = RollingRateLimiter(rpm_limit=rpm_limit, tpm_limit=tpm_limit)
 
     # ── Core API calls (sync + async) ─────────────────────────────────────
@@ -281,45 +280,6 @@ class AnalysisClient:
                 time.sleep(self.retry_delay)
         raise RuntimeError(f"Failed after {self.max_retries} retries")
 
-    async def _call_api_async(self, prompt, max_tokens=4096, model_override=None,
-                               system_prompt=None, estimated_tokens=None):
-        """Async API call with rate limiting and prompt caching."""
-        import anthropic
-        import asyncio
-        use_model = model_override or self.model
-        est = estimated_tokens or self._TOKENS_FULL_CHUNK
-
-        # Rate limiter is sync but thread-safe; run in executor to avoid blocking event loop
-        loop = asyncio.get_event_loop()
-        await loop.run_in_executor(None, self.rate_limiter.wait_if_needed, est)
-
-        kwargs = {
-            "model": use_model,
-            "max_tokens": max_tokens,
-            "temperature": 0.0,
-            "messages": [{"role": "user", "content": prompt}],
-        }
-
-        if system_prompt:
-            kwargs["system"] = [{
-                "type": "text",
-                "text": system_prompt,
-                "cache_control": {"type": "ephemeral"},
-            }]
-
-        for attempt in range(1, self.max_retries + 1):
-            try:
-                r = await self.async_client.messages.create(**kwargs)
-                return "".join(b.text for b in r.content if b.type == "text").strip()
-            except anthropic.RateLimitError:
-                w = self.retry_delay * (2 ** (attempt - 1))
-                logger.warning(f"Rate limited — {w:.1f}s (attempt {attempt})")
-                await asyncio.sleep(w)
-            except anthropic.APIError as e:
-                logger.error(f"API error attempt {attempt}: {e}")
-                if attempt == self.max_retries: raise
-                await asyncio.sleep(self.retry_delay)
-        raise RuntimeError(f"Failed after {self.max_retries} retries")
 
     # ── Full mode (sync) ──────────────────────────────────────────────────
 
@@ -353,35 +313,6 @@ class AnalysisClient:
                 model_override=self.p2_model,
                 estimated_tokens=self._TOKENS_HOLISTIC_FAST))))
 
-    # ── Parallel fast-mode chunk processing ──────────────────────────────
-
-    async def analyze_chunks_parallel_fast(self, chunks, book_context, max_concurrent=2):
-        """
-        Process slim chunks with bounded concurrency (default 2).
-        The rate limiter gates actual throughput — the semaphore is a hard ceiling.
-        Safe for Tier 1 API limits.
-        """
-        import asyncio
-        semaphore = asyncio.Semaphore(max_concurrent)
-        results = [None] * len(chunks)
-        failed = []
-
-        async def process_chunk(i, chunk):
-            async with semaphore:
-                try:
-                    system, user = _build_slim_chunk_prompt_cached(chunk, book_context)
-                    raw = await self._call_api_async(
-                        user, 512, system_prompt=system,
-                        estimated_tokens=self._TOKENS_SLIM_CHUNK)
-                    results[i] = SlimChunkAnalysis(**_sanitize_slim_chunk_data(
-                        _safe_parse_json(raw)))
-                    logger.info(f"  ✓ Chunk {i+1}/{len(chunks)} complete")
-                except Exception as e:
-                    logger.error(f"  ✗ Chunk {i+1} failed: {e}")
-                    failed.append(i)
-
-        await asyncio.gather(*[process_chunk(i, c) for i, c in enumerate(chunks)])
-        return [r for r in results if r is not None], failed
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
