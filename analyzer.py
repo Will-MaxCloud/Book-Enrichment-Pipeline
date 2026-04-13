@@ -13,6 +13,7 @@ from __future__ import annotations
 import json
 import logging
 import time
+from collections import deque
 from typing import Any
 
 from schemas import (
@@ -186,6 +187,40 @@ JSON:"""
     return system, user
 
 
+def _build_slim_batch_prompt_cached(chunks, book_context):
+    """Returns (system_prompt, user_prompt) for analysing multiple chunks in one call.
+
+    The model returns a JSON ARRAY — one SlimChunkAnalysis object per section.
+    Sending N chunks per call reduces API call count by N× with negligible
+    quality risk (each section is clearly labelled and separated).
+    """
+    flag_values = ", ".join(f'"{f.value}"' for f in ContentFlag)
+
+    system = f"""Score text sections. Respond ONLY with JSON, no preamble.
+SCORING (1-10): tone (1=light, 10=dark), readability (1=hard, 10=easy),
+violence (1=none, 10=extreme), pace (1=slow, 10=fast), worldbuilding (1=none, 10=exhaustive),
+humor (1=none, 10=maximum), romance (1=none, 10=maximum).
+For each section return: chunk_index, chunk_label, word_count, tone, readability, violence,
+pace, worldbuilding, humor, romance (all int 1-10), character_names (list of named characters),
+content_flags (from [{flag_values}]), summary (one sentence).
+Analyse each section INDEPENDENTLY — do not let one section influence another's scores."""
+
+    sections = []
+    for i, chunk in enumerate(chunks):
+        sections.append(
+            f"SECTION {i + 1} (chunk_index={chunk.index}, label=\"{chunk.label}\", "
+            f"~{chunk.word_count} words):\n---\n{chunk.text[:14000]}\n---"
+        )
+
+    user = (
+        f"CONTEXT: {book_context}\n\n"
+        + "\n\n".join(sections)
+        + f"\n\nReturn a JSON ARRAY with exactly {len(chunks)} objects, "
+        "one per section in order:\n[{{...}}, {{...}}]\nJSON:"
+    )
+    return system, user
+
+
 def _build_holistic_prompt(chunk_analyses, extraction):
     chunk_summaries = []
     for ca in chunk_analyses:
@@ -300,18 +335,56 @@ JSON:"""
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
+# RATE LIMITER
+# ═══════════════════════════════════════════════════════════════════════════════
+
+class RateLimiter:
+    """Sliding-window rate limiter for async API calls.
+
+    Tracks request timestamps in a deque. Before each request, drops
+    timestamps older than 60s and waits if we're at the RPM ceiling.
+    """
+    def __init__(self, max_rpm: int = 40):
+        self.max_rpm = max_rpm
+        self._timestamps: deque = deque()
+        self._lock = None  # Initialised lazily after event loop starts
+
+    async def acquire(self):
+        import asyncio
+        if self._lock is None:
+            self._lock = asyncio.Lock()
+        async with self._lock:
+            now = time.monotonic()
+            # Drop timestamps outside the 60-second window
+            while self._timestamps and now - self._timestamps[0] >= 60.0:
+                self._timestamps.popleft()
+            if len(self._timestamps) >= self.max_rpm:
+                wait = 60.0 - (now - self._timestamps[0])
+                if wait > 0:
+                    logger.debug(f"Rate limiter: waiting {wait:.1f}s (at {self.max_rpm} RPM)")
+                    await asyncio.sleep(wait)
+                # Re-drop after sleep
+                now = time.monotonic()
+                while self._timestamps and now - self._timestamps[0] >= 60.0:
+                    self._timestamps.popleft()
+            self._timestamps.append(time.monotonic())
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
 # API CLIENT
 # ═══════════════════════════════════════════════════════════════════════════════
 
 class AnalysisClient:
     def __init__(self, api_key, model="claude-sonnet-4-20250514",
                  p2_model=None, max_retries=3, retry_delay=2.0,
-                 max_concurrent=2):
+                 max_concurrent=2, chunk_batch_size=1, rpm_limit=40):
         self.api_key = api_key
         self.model = model
         self.p2_model = p2_model or model
         self.max_retries, self.retry_delay = max_retries, retry_delay
         self.max_concurrent = max_concurrent
+        self.chunk_batch_size = chunk_batch_size
+        self.rpm_limit = rpm_limit
 
     # ── Core API calls (sync + async) ─────────────────────────────────────
 
@@ -418,45 +491,81 @@ class AnalysisClient:
 
     async def analyze_chunks_parallel(self, chunks, book_context, slim=False):
         """
-        Process chunks concurrently with safety controls:
-        - Max 2 concurrent requests (semaphore)
-        - 1s stagger delay between launching each task
-        - Full retry logic per request
+        Process chunks concurrently with rate-aware safety controls:
+        - Max `max_concurrent` requests in flight (semaphore)
+        - Sliding-window rate limiter (default 40 RPM) prevents 429 errors
+        - If chunk_batch_size > 1 and slim=True: groups chunks into batches,
+          halving/thirding call count and RPM pressure
         """
         import asyncio
         semaphore = asyncio.Semaphore(self.max_concurrent)
-        results = [None] * len(chunks)
-        failed = []
+        rate_limiter = RateLimiter(max_rpm=self.rpm_limit)
+        failed_chunks = []
 
-        async def process_chunk(i, chunk):
-            async with semaphore:
-                try:
-                    if slim:
-                        system, user = _build_slim_chunk_prompt_cached(chunk, book_context)
-                        raw = await self._call_api_async(user, 512, system_prompt=system)
-                        results[i] = SlimChunkAnalysis(**_sanitize_slim_chunk_data(
-                            _safe_parse_json(raw)))
-                    else:
-                        system, user = _build_chunk_prompt_cached(chunk, book_context)
-                        raw = await self._call_api_async(user, system_prompt=system)
-                        results[i] = ChunkAnalysis(**_sanitize_chunk_data(
-                            _safe_parse_json(raw)))
-                    logger.info(f"  ✓ Chunk {i+1}/{len(chunks)} complete")
-                except Exception as e:
-                    logger.error(f"  ✗ Chunk {i} failed: {e}")
-                    failed.append(i)
+        if slim and self.chunk_batch_size > 1:
+            # ── Batched slim mode ─────────────────────────────────────────
+            batches = [
+                chunks[i:i + self.chunk_batch_size]
+                for i in range(0, len(chunks), self.chunk_batch_size)
+            ]
+            results = [None] * len(chunks)
 
-        # Stagger launches — 1s between each to prevent rate limit bursts
-        tasks = []
-        for i, chunk in enumerate(chunks):
-            task = asyncio.create_task(process_chunk(i, chunk))
-            tasks.append(task)
-            await asyncio.sleep(1.0)
+            async def process_batch(batch):
+                async with semaphore:
+                    await rate_limiter.acquire()
+                    try:
+                        system, user = _build_slim_batch_prompt_cached(batch, book_context)
+                        raw = await self._call_api_async(user, 512 * len(batch), system_prompt=system)
+                        parsed = _safe_parse_json(raw)
+                        # Response must be a list; if model returned a single dict, wrap it
+                        if isinstance(parsed, dict):
+                            parsed = [parsed]
+                        for j, item in enumerate(parsed):
+                            if j < len(batch):
+                                chunk = batch[j]
+                                item.setdefault("chunk_index", chunk.index)
+                                item.setdefault("chunk_label", chunk.label)
+                                item.setdefault("word_count", chunk.word_count)
+                                results[chunk.index] = SlimChunkAnalysis(
+                                    **_sanitize_slim_chunk_data(item))
+                        labels = ", ".join(c.label for c in batch)
+                        logger.info(f"  ✓ Batch complete: {labels}")
+                    except Exception as e:
+                        logger.error(f"  ✗ Batch failed ({[c.label for c in batch]}): {e}")
+                        for chunk in batch:
+                            failed_chunks.append(chunk.index)
 
-        await asyncio.gather(*tasks)
+            tasks = [asyncio.create_task(process_batch(b)) for b in batches]
+            await asyncio.gather(*tasks)
+
+        else:
+            # ── Single-chunk mode (slim or quality) ───────────────────────
+            results = [None] * len(chunks)
+
+            async def process_chunk(i, chunk):
+                async with semaphore:
+                    await rate_limiter.acquire()
+                    try:
+                        if slim:
+                            system, user = _build_slim_chunk_prompt_cached(chunk, book_context)
+                            raw = await self._call_api_async(user, 512, system_prompt=system)
+                            results[i] = SlimChunkAnalysis(**_sanitize_slim_chunk_data(
+                                _safe_parse_json(raw)))
+                        else:
+                            system, user = _build_chunk_prompt_cached(chunk, book_context)
+                            raw = await self._call_api_async(user, system_prompt=system)
+                            results[i] = ChunkAnalysis(**_sanitize_chunk_data(
+                                _safe_parse_json(raw)))
+                        logger.info(f"  ✓ Chunk {i+1}/{len(chunks)} complete")
+                    except Exception as e:
+                        logger.error(f"  ✗ Chunk {i} failed: {e}")
+                        failed_chunks.append(i)
+
+            tasks = [asyncio.create_task(process_chunk(i, c)) for i, c in enumerate(chunks)]
+            await asyncio.gather(*tasks)
 
         successful = [r for r in results if r is not None]
-        return successful, failed
+        return successful, failed_chunks
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
