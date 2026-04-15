@@ -604,8 +604,8 @@ class HolisticAnalysis(BaseModel):
     overall_summary: str
     character_arcs: dict[str, str]
     character_genders: dict[str, str] = Field(default_factory=dict)
-    character_archetypes: dict[str, list[str]] = Field(default_factory=dict, description="name -> [archetype1, archetype2]")
-    character_ages: dict[str, str] = Field(default_factory=dict, description="name -> child/teen/young_adult/adult/elderly")
+    character_archetypes: dict[str, list[str]] = Field(default_factory=dict, description="Archetypes per character")
+    character_ages: dict[str, str] = Field(default_factory=dict, description="Age category per character")
     ranked_themes: list[str] = Field(default_factory=list, description="Top 10 themes ranked most important first")
     ranked_characters: list[str] = Field(default_factory=list, description="Top 8 characters ranked most important first")
     humor_types: list[HumorType] = Field(min_length=1, max_length=3)

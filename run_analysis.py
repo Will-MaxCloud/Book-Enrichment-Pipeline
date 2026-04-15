@@ -145,6 +145,8 @@ def _run_quality_pipeline(client, extraction, book_context):
         except Exception as e:
             logger.error(f"  ✗ Chunk {i} failed: {e}")
             failed.append(i)
+        if i < len(extraction.chunks) - 1:
+            time.sleep(0.5)
 
     if not chunk_analyses:
         logger.error("All chunks failed.")
@@ -178,6 +180,8 @@ def _run_fast_pipeline(client, extraction, book_context):
         except Exception as e:
             logger.error(f"  ✗ Chunk {i} failed: {e}")
             failed.append(i)
+        if i < len(extraction.chunks) - 1:
+            time.sleep(0.3)  # Shorter delay for faster model
 
     if not slim_analyses:
         logger.error("All chunks failed.")
@@ -211,7 +215,7 @@ def batch_analyze(
         logger.error(f"No PDF or EPUB files found in {directory}")
         return []
 
-    logger.info(f"Found {len(pdf_files)} books to analyze")
+    logger.info(f"Found {len(pdf_files)} PDFs to analyze")
     out = output_dir or str(Path(directory) / "analysis_output")
     results: list[str] = []
 
@@ -221,16 +225,10 @@ def batch_analyze(
         logger.info(f"{'▓'*60}")
         try:
             analyze_book(str(pdf_path), api_key=api_key, output_dir=out,
-                        p1_model=p1_model, p2_model=p2_model,
-                        fast_mode=fast_mode)
+                        p1_model=p1_model, p2_model=p2_model, fast_mode=fast_mode)
             results.append(pdf_path.name)
         except Exception as e:
             logger.error(f"Failed: {pdf_path.name}: {e}")
-
-        # Brief cooldown between books so the next book starts with headroom
-        if i < len(pdf_files) - 1:
-            logger.info("  Inter-book cooldown: 15s...")
-            time.sleep(15)
 
     logger.info(f"\nBatch complete: {len(results)}/{len(pdf_files)} succeeded")
     return results

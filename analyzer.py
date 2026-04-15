@@ -37,72 +37,85 @@ logger = logging.getLogger(__name__)
 def _format_anchors(key: str) -> str:
     return "\n".join(f"  {s} = {d}" for s, d in SCORE_ANCHORS[key].items())
 
-# ── Cached prompt builders (split static system / dynamic user) ───────────
-
-def _build_chunk_prompt_cached(chunk, book_context):
-    """Returns (system_prompt, user_prompt) for prompt caching."""
+def _build_chunk_prompt(chunk: TextChunk, book_context: str) -> str:
     theme_list = "\n".join(f'  - "{t}"' for t in MASTER_THEMES)
     archetype_values = ", ".join(f'"{a.value}"' for a in CharacterArchetype)
     humor_values = ", ".join(f'"{h.value}"' for h in HumorType)
     flag_values = ", ".join(f'"{f.value}"' for f in ContentFlag)
 
-    system = f"""You are a literary analyst. Respond ONLY with valid JSON. No preamble, no markdown.
+    return f"""You are a literary analyst. Respond ONLY with valid JSON. No preamble, no markdown.
 
-SCORING RUBRICS:
-TONE (1-10): {_format_anchors("tone")}
-READABILITY (1-10): {_format_anchors("readability")}
-VIOLENCE (1-10): {_format_anchors("violence")}
-PACE (1-10): {_format_anchors("pace")}
-WORLDBUILDING (1-10): {_format_anchors("worldbuilding")}
-HUMOR (1-10): {_format_anchors("humor")}
-ROMANCE (1-10): {_format_anchors("romance")}
-CHARACTER IMPORTANCE (1-10): {_format_anchors("character_importance")}
-THEME PROMINENCE (1-10): {_format_anchors("prominence")}
-
-MASTER THEME LIST (pick from this list ONLY):
-{theme_list}
-
-CONTENT FLAGS (content warnings ONLY): {flag_values}
-"sexual_content" = consensual. "sexual_violence" = assault.
-
-Return JSON with: chunk_index, chunk_label, word_count, themes_detected, theme_prominences,
-characters_present (name, role, importance, gender, archetypes [{archetype_values}], arc_summary, age_category),
-humor_density, humor_types [{humor_values}], tone, readability_score, violence_level, pace_score,
-romance_level, worldbuilding_level, content_flags, notable_observations.
-
-RULES: 2-8 themes from MASTER LIST ONLY. Only named characters with real arc_summaries. Content flags are warnings only."""
-
-    user = f"""CONTEXT: {book_context}
+CONTEXT: {book_context}
 SECTION: {chunk.label} (pages {chunk.page_start}-{chunk.page_end}, ~{chunk.word_count} words)
 
-Analyze and return JSON:
+═══ SCORING RUBRICS ═══
+TONE (1-10):
+{_format_anchors("tone")}
+READABILITY (1-10):
+{_format_anchors("readability")}
+VIOLENCE (1-10):
+{_format_anchors("violence")}
+PACE (1-10):
+{_format_anchors("pace")}
+WORLDBUILDING (1-10):
+{_format_anchors("worldbuilding")}
+HUMOR (1-10):
+{_format_anchors("humor")}
+ROMANCE (1-10):
+{_format_anchors("romance")}
+CHARACTER IMPORTANCE (1-10):
+{_format_anchors("character_importance")}
+THEME PROMINENCE (1-10):
+{_format_anchors("prominence")}
+
+═══ MASTER THEME LIST — pick from this list ONLY ═══
+{theme_list}
+
+═══ CONTENT FLAGS (content warnings ONLY) ═══
+{flag_values}
+"sexual_content" = consensual. "sexual_violence" = assault. These are DIFFERENT.
+
+═══ REQUIRED JSON ═══
+{{
+  "chunk_index": {chunk.index},
+  "chunk_label": "{chunk.label}",
+  "word_count": {chunk.word_count},
+  "themes_detected": ["theme from master list"],
+  "theme_prominences": {{"theme": int_1_to_10}},
+  "characters_present": [
+    {{
+      "name": "character's ACTUAL name (not generic descriptions)",
+      "role": "string",
+      "importance": int_1_to_10,
+      "gender": "male|female|non-binary|unknown",
+      "archetypes": [{archetype_values}],
+      "arc_summary": "1-2 sentences about what this character DOES in this section. NEVER leave empty.",
+      "age_category": "child|teen|young_adult|adult|elderly|ageless|null"
+    }}
+  ],
+  "humor_density": int_1_to_10,
+  "humor_types": [{humor_values}],
+  "tone": int_1_to_10,
+  "readability_score": int_1_to_10,
+  "violence_level": int_1_to_10,
+  "pace_score": int_1_to_10,
+  "romance_level": int_1_to_10,
+  "worldbuilding_level": int_1_to_10,
+  "content_flags": [{flag_values}],
+  "notable_observations": "string"
+}}
+
+RULES:
+- 2-8 themes from MASTER LIST ONLY.
+- Only named characters. Every character MUST have a real arc_summary (not empty, not generic).
+- Content flags are warnings only — not themes.
+
+TEXT:
 ---
 {chunk.text[:14000]}
 ---
+
 JSON:"""
-    return system, user
-
-
-def _build_slim_chunk_prompt_cached(chunk, book_context):
-    """Returns (system_prompt, user_prompt) for cached slim analysis."""
-    flag_values = ", ".join(f'"{f.value}"' for f in ContentFlag)
-
-    system = f"""Score text sections. Respond ONLY with JSON, no preamble.
-SCORING (1-10): tone (1=light, 10=dark), readability (1=hard, 10=easy),
-violence (1=none, 10=extreme), pace (1=slow, 10=fast), worldbuilding (1=none, 10=exhaustive),
-humor (1=none, 10=maximum), romance (1=none, 10=maximum).
-Return JSON with: chunk_index, chunk_label, word_count, tone, readability, violence,
-pace, worldbuilding, humor, romance (all int 1-10), character_names (list),
-content_flags [{flag_values}], summary (one sentence)."""
-
-    user = f"""CONTEXT: {book_context}
-SECTION: {chunk.label} (~{chunk.word_count} words)
-
----
-{chunk.text[:14000]}
----
-JSON:"""
-    return system, user
 
 
 def _build_holistic_prompt(chunk_analyses, extraction):
@@ -150,10 +163,10 @@ TOTAL: {extraction.total_words:,} words, {extraction.total_pages} pages
 {_format_anchors("age_target")}
 
 ═══ OPENING TEXT ═══
-{extraction.opening_text}
+{extraction.opening_text[:6000]}
 
 ═══ CLOSING TEXT ═══
-{extraction.closing_text}
+{extraction.closing_text[:6000]}
 
 ═══ SECTION SPINE ═══
 {chunk_spine}
@@ -213,6 +226,7 @@ CRITICAL RULES:
   to the story — protagonist first, then major characters. Do NOT include minor characters
   who only appear briefly or in a few scenes.
 - categories must be exactly 3 items from the category list.
+- sub_genres: Each sub-genre must be UNIQUE — no duplicates. 1-4 distinct sub-genres.
 - Pay attention to CLOSING TEXT for sad_ending and cliffhanger.
 
 JSON:"""
@@ -223,52 +237,22 @@ JSON:"""
 # ═══════════════════════════════════════════════════════════════════════════════
 
 class AnalysisClient:
-    # Token estimates per call type (conservative upper bounds)
-    _TOKENS_SLIM_CHUNK = 3_100    # Haiku Pass 1 slim
-    _TOKENS_FULL_CHUNK = 5_000    # Sonnet Pass 1 full
-    _TOKENS_HOLISTIC_FAST = 9_200  # Sonnet Pass 2 fast
-    _TOKENS_HOLISTIC_FULL = 11_000 # Sonnet Pass 2 quality
-
     def __init__(self, api_key, model="claude-sonnet-4-20250514",
-                 p2_model=None, max_retries=3, retry_delay=2.0,
-                 rpm_limit=50, tpm_limit=50_000):
-        import anthropic
-        from ratelimiter import RollingRateLimiter
+                 p2_model=None, max_retries=3, retry_delay=2.0):
         self.api_key = api_key
         self.model = model
         self.p2_model = p2_model or model
         self.max_retries, self.retry_delay = max_retries, retry_delay
-        self.client = anthropic.Anthropic(api_key=api_key)
-        self.rate_limiter = RollingRateLimiter(rpm_limit=rpm_limit, tpm_limit=tpm_limit)
 
-    # ── Core API calls (sync + async) ─────────────────────────────────────
-
-    def _call_api(self, prompt, max_tokens=4096, model_override=None,
-                  system_prompt=None, estimated_tokens=None):
-        """Sync API call with rate limiting and prompt caching."""
+    def _call_api(self, prompt, max_tokens=4096, model_override=None):
         import anthropic
+        client = anthropic.Anthropic(api_key=self.api_key)
         use_model = model_override or self.model
-        est = estimated_tokens or self._TOKENS_FULL_CHUNK
-
-        self.rate_limiter.wait_if_needed(est)
-
-        kwargs = {
-            "model": use_model,
-            "max_tokens": max_tokens,
-            "temperature": 0.0,
-            "messages": [{"role": "user", "content": prompt}],
-        }
-
-        if system_prompt:
-            kwargs["system"] = [{
-                "type": "text",
-                "text": system_prompt,
-                "cache_control": {"type": "ephemeral"},
-            }]
-
         for attempt in range(1, self.max_retries + 1):
             try:
-                r = self.client.messages.create(**kwargs)
+                r = client.messages.create(
+                    model=use_model, max_tokens=max_tokens, temperature=0.0,
+                    messages=[{"role": "user", "content": prompt}])
                 return "".join(b.text for b in r.content if b.type == "text").strip()
             except anthropic.RateLimitError:
                 w = self.retry_delay * (2 ** (attempt - 1))
@@ -280,39 +264,28 @@ class AnalysisClient:
                 time.sleep(self.retry_delay)
         raise RuntimeError(f"Failed after {self.max_retries} retries")
 
-
-    # ── Full mode (sync) ──────────────────────────────────────────────────
-
+    # ── Full mode ─────────────────────────────────────────────────────────
     def analyze_chunk(self, chunk, book_context):
-        system, user = _build_chunk_prompt_cached(chunk, book_context)
         return ChunkAnalysis(**_sanitize_chunk_data(
-            _safe_parse_json(self._call_api(
-                user, system_prompt=system,
-                estimated_tokens=self._TOKENS_FULL_CHUNK))))
+            _safe_parse_json(self._call_api(_build_chunk_prompt(chunk, book_context)))))
 
     def analyze_holistic(self, chunk_analyses, extraction):
         return HolisticAnalysis(**_sanitize_holistic_data(
             _safe_parse_json(self._call_api(
                 _build_holistic_prompt(chunk_analyses, extraction), 4096,
-                model_override=self.p2_model,
-                estimated_tokens=self._TOKENS_HOLISTIC_FULL))))
+                model_override=self.p2_model))))
 
-    # ── Fast mode (sync) ──────────────────────────────────────────────────
-
+    # ── Fast mode ─────────────────────────────────────────────────────────
     def analyze_chunk_slim(self, chunk, book_context):
-        system, user = _build_slim_chunk_prompt_cached(chunk, book_context)
         return SlimChunkAnalysis(**_sanitize_slim_chunk_data(
             _safe_parse_json(self._call_api(
-                user, 512, system_prompt=system,
-                estimated_tokens=self._TOKENS_SLIM_CHUNK))))
+                _build_slim_chunk_prompt(chunk, book_context), 1024))))
 
     def analyze_holistic_fast(self, slim_analyses, extraction):
         return HolisticAnalysis(**_sanitize_holistic_data(
             _safe_parse_json(self._call_api(
                 _build_fast_holistic_prompt(slim_analyses, extraction), 4096,
-                model_override=self.p2_model,
-                estimated_tokens=self._TOKENS_HOLISTIC_FAST))))
-
+                model_override=self.p2_model))))
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -745,16 +718,16 @@ def _sanitize_holistic_data(data):
     if not data.get("categories"):
         data["categories"] = ["standalone"]
 
-    # Sub-genres (with deduplication)
+    # Sub-genres (deduplicate after normalizing)
     if "sub_genres" in data and isinstance(data["sub_genres"], list):
         norm = [_normalize_sub_genre(sg) for sg in data["sub_genres"] if isinstance(sg, str)]
         seen_sg = set()
-        deduped_sg = []
+        deduped = []
         for s in norm:
             if s and s.lower() not in seen_sg:
                 seen_sg.add(s.lower())
-                deduped_sg.append(s)
-        data["sub_genres"] = deduped_sg[:4] or ["literary fiction"]
+                deduped.append(s)
+        data["sub_genres"] = deduped[:4] or ["literary fiction"]
     else:
         data["sub_genres"] = ["literary fiction"]
 
@@ -799,16 +772,18 @@ def _sanitize_holistic_data(data):
     if "character_archetypes" not in data or not isinstance(data.get("character_archetypes"), dict):
         data["character_archetypes"] = {}
     else:
-        # Sanitize each character's archetypes list
-        cleaned_archs = {}
-        for name, archs in data["character_archetypes"].items():
+        # Sanitize each character's archetype list
+        sanitized_archetypes = {}
+        for char_name, archs in data["character_archetypes"].items():
             if isinstance(archs, list):
-                sanitized = _sanitize_enum_list(archs, _VALID_ARCH, _ARCH_MAP, "other")[:3]
-                cleaned_archs[name] = sanitized
+                sanitized_archetypes[char_name] = _sanitize_enum_list(
+                    archs, _VALID_ARCH, _ARCH_MAP, "other")[:3]
             elif isinstance(archs, str):
-                sanitized = _sanitize_enum_list([archs], _VALID_ARCH, _ARCH_MAP, "other")[:3]
-                cleaned_archs[name] = sanitized
-        data["character_archetypes"] = cleaned_archs
+                sanitized_archetypes[char_name] = _sanitize_enum_list(
+                    [archs], _VALID_ARCH, _ARCH_MAP, "other")[:3]
+            else:
+                sanitized_archetypes[char_name] = ["other"]
+        data["character_archetypes"] = sanitized_archetypes
     if "character_ages" not in data or not isinstance(data.get("character_ages"), dict):
         data["character_ages"] = {}
     if "ranked_themes" in data and isinstance(data["ranked_themes"], list):
@@ -1169,6 +1144,49 @@ def _aggregate_characters_for_prompt(chunks):
 # FAST MODE — Slim Pass 1 (Haiku) + Rich Pass 2 (Sonnet)
 # ═══════════════════════════════════════════════════════════════════════════════
 
+def _build_slim_chunk_prompt(chunk, book_context):
+    """Tiny prompt for Haiku — just scores, names, flags, summary."""
+    flag_values = ", ".join(f'"{f.value}"' for f in ContentFlag)
+
+    return f"""Score this text section. Respond ONLY with JSON, no preamble.
+
+CONTEXT: {book_context}
+SECTION: {chunk.label} (~{chunk.word_count} words)
+
+SCORING (1-10):
+  tone: 1=light/cheerful, 5=balanced, 10=extremely dark/bleak
+  readability: 1=very hard/dense, 5=average, 10=effortless/simple
+  violence: 1=none, 5=moderate fights, 10=extreme gore
+  pace: 1=very slow, 5=moderate, 10=relentless action
+  worldbuilding: 1=no setting detail, 5=moderate, 10=exhaustive
+  humor: 1=none, 5=regular comedy, 10=maximum comedy
+  romance: 1=none, 5=notable romance, 10=love story is everything
+
+JSON:
+{{
+  "chunk_index": {chunk.index},
+  "chunk_label": "{chunk.label}",
+  "word_count": {chunk.word_count},
+  "tone": int,
+  "readability": int,
+  "violence": int,
+  "pace": int,
+  "worldbuilding": int,
+  "humor": int,
+  "romance": int,
+  "character_names": ["up to 10 FICTIONAL character names only — not real people, editors, or authors"],
+  "content_flags": [{flag_values}],
+  "summary": "One sentence summary of what happens in this section."
+}}
+
+TEXT:
+---
+{chunk.text[:14000]}
+---
+
+JSON:"""
+
+
 def _sanitize_slim_chunk_data(data):
     """Sanitize slim chunk data."""
     for f in ["tone", "readability", "violence", "pace",
@@ -1180,7 +1198,7 @@ def _sanitize_slim_chunk_data(data):
 
     if "character_names" in data and isinstance(data["character_names"], list):
         data["character_names"] = [n.strip() for n in data["character_names"]
-                                    if isinstance(n, str) and n.strip() and len(n.strip()) >= 2]
+                                    if isinstance(n, str) and n.strip() and len(n.strip()) >= 2][:10]
     else:
         data["character_names"] = []
 
@@ -1243,10 +1261,10 @@ TOTAL: {extraction.total_words:,} words, {extraction.total_pages} pages
 {_format_anchors("age_target")}
 
 ═══ OPENING TEXT ═══
-{extraction.opening_text}
+{extraction.opening_text[:6000]}
 
 ═══ CLOSING TEXT ═══
-{extraction.closing_text}
+{extraction.closing_text[:6000]}
 
 ═══ SECTION SPINE ═══
 {chunk_spine}
@@ -1291,7 +1309,7 @@ TOTAL: {extraction.total_words:,} words, {extraction.total_pages} pages
     "CharacterName": ["1-3 archetypes from: {arch_values}"]
   }},
   "character_ages": {{
-    "CharacterName": "child|teen|young_adult|adult|elderly"
+    "CharacterName": "child|teen|young_adult|adult|elderly|ageless|null"
   }},
   "ranked_themes": ["top 10 themes from MASTER LIST, ranked most important first"],
   "ranked_characters": ["top 8 character names, ranked most important first"],
@@ -1304,8 +1322,10 @@ CRITICAL RULES:
   CORE to this book. Use ONLY themes from the list. Rank most-important first.
 - ranked_characters: From the detected characters [{char_names_str}], pick the TOP 8
   most important. Protagonist first. Do NOT include minor characters.
-- You MUST provide character_arcs, character_genders, character_archetypes, and character_ages for each ranked character.
-  Each arc must be 1-3 real sentences. Never empty or generic.
+- You MUST provide character_arcs, character_genders, character_archetypes, and
+  character_ages for each ranked character. Each arc must be 1-3 real sentences.
+  Never empty or generic.
+- sub_genres: Each sub-genre must be UNIQUE — no duplicates. 1-4 distinct sub-genres.
 - content_flags: Pick only the TOP 4 most significant content warnings. Not themes.
 - categories must be exactly 3 from the category list.
 - Pay attention to CLOSING TEXT for sad_ending and cliffhanger.
@@ -1377,31 +1397,31 @@ def aggregate_analysis_fast(slim_analyses, holistic, extraction):
         if gender not in ("male", "female", "non-binary", "unknown"):
             gender = "unknown"
 
-        # Archetypes from Pass 2
+        # Archetypes from Pass 2 (fallback to OTHER)
         char_archetypes = [CharacterArchetype.OTHER]
-        for aak, aav in archetypes_map.items():
-            if aak.lower().strip() == char_name.lower().strip() or \
-               _same_char(aak.lower(), char_name.lower()):
-                if isinstance(aav, list) and aav:
-                    # Already sanitized by _sanitize_holistic_data
-                    char_archetypes = []
-                    for arch_str in aav[:3]:
-                        try:
-                            char_archetypes.append(CharacterArchetype(arch_str))
-                        except ValueError:
-                            pass
-                    if not char_archetypes:
-                        char_archetypes = [CharacterArchetype.OTHER]
+        for ark, arv in archetypes_map.items():
+            if ark.lower().strip() == char_name.lower().strip() or \
+               _same_char(ark.lower(), char_name.lower()):
+                if isinstance(arv, list) and arv:
+                    mapped = []
+                    for a in arv:
+                        if isinstance(a, str):
+                            al = a.lower().strip().replace(" ", "_").replace("-", "_")
+                            if al in _VALID_ARCH:
+                                mapped.append(CharacterArchetype(al))
+                            elif al in _ARCH_MAP and _ARCH_MAP[al] != "_skip":
+                                mapped.append(CharacterArchetype(_ARCH_MAP[al]))
+                    char_archetypes = mapped[:3] if mapped else [CharacterArchetype.OTHER]
                 break
 
-        # Age from Pass 2
-        char_age = None
+        # Age category from Pass 2 (fallback to None)
+        age_cat = None
+        valid_ages = {"child", "teen", "young_adult", "adult", "elderly", "ageless"}
         for agk, agv in ages_map.items():
             if agk.lower().strip() == char_name.lower().strip() or \
                _same_char(agk.lower(), char_name.lower()):
-                if isinstance(agv, str) and agv.lower().strip() in (
-                    "child", "teen", "young_adult", "adult", "elderly"):
-                    char_age = agv.lower().strip()
+                if isinstance(agv, str) and agv.lower().strip() in valid_ages:
+                    age_cat = agv.lower().strip()
                 break
 
         # Count appearances across slim chunks for importance
@@ -1430,19 +1450,22 @@ def aggregate_analysis_fast(slim_analyses, holistic, extraction):
         characters.append(Character(
             name=char_name, role="", importance=imp,
             gender=gender, archetypes=char_archetypes,
-            arc_summary=arc, age_category=char_age))
+            arc_summary=arc, age_category=age_cat))
 
     humor = HumorProfile(
         humor_density=ratings.humor,
         primary_humor_types=holistic.humor_types if holistic.humor_types else [HumorType.NONE])
 
-    # Content flags: union of Pass 1 slim chunk flags + Pass 2 flags, capped at 4
+    # Content flags: union from chunks, but capped at 4 by Pass 2
     flags = set()
     for sa in slim_analyses:
         flags.update(sa.content_flags)
     flags.update(holistic.content_flags)
     flags.discard(ContentFlag.NONE)
-    cflags = sorted(flags, key=lambda f: f.value)[:4] or [ContentFlag.NONE]
+    # Use Pass 2's flags as the curated top 4
+    p2_flags = set(holistic.content_flags)
+    p2_flags.discard(ContentFlag.NONE)
+    cflags = sorted(p2_flags, key=lambda f: f.value)[:4] or [ContentFlag.NONE]
 
     return BookAnalysis(
         metadata=metadata, themes=themes,

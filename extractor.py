@@ -85,6 +85,175 @@ CHAPTER_PATTERNS = [
 ]
 
 
+# ── Back-matter detection (trim-from-tail approach) ──────────────────────────
+#
+# DESIGN PRINCIPLES:
+# 1. Only trim from the END of the book, scanning backwards
+# 2. Stop the moment we hit a section that looks like story content
+# 3. Never filter sections in the middle or beginning of the book
+# 4. Err on the side of INCLUDING content (lenient, not strict)
+# 5. Multilingual — covers major European languages
+#
+# This means: a chapter called "The Acknowledgment" at position 50% is
+# always safe, because we'd hit story chapters after it and stop.
+
+# Patterns that DEFINITIVELY mark a section as story content.
+# If we see any of these while scanning backwards, we STOP trimming immediately.
+_STORY_MARKERS = re.compile(
+    r"(?i)^\s*("
+    # Chapter markers (multilingual)
+    r"chapter\s+\w|capitolo\s+\w|chapitre\s+\w|cap[ií]tulo\s+\w|kapitel\s+\w"
+    r"|cap\.\s*\w"
+    # Part markers
+    r"|part\s+\w|parte\s+\w|partie\s+\w|teil\s+\w"
+    # Numbered sections (1. / I. / 01.)
+    r"|\d+\.\s+[A-Z]|[IVXLCDM]+\.\s+[A-Z]"
+    # Prologue/Epilogue markers (multilingual) — these ARE story content
+    r"|prologue|prologo|pr[oó]logo|prolog"
+    r"|epilogue|epilogo|ep[ií]logo|epilog"
+    r")\b",
+    re.MULTILINE,
+)
+
+# High-confidence back-matter headings (multilingual).
+# These are terms that essentially NEVER appear as chapter titles in fiction
+# or non-fiction narrative. Each group covers: EN, IT, FR, ES, DE, PT
+_BACK_MATTER_HEADINGS = re.compile(
+    r"(?i)^\s*("
+    # Acknowledgments
+    r"acknowledg[e]?ments?|ringraziamenti|remerciements|agradecimientos"
+    r"|danksagung|agradecimentos"
+    # Copyright / legal
+    r"|copyright|all\s+rights\s+reserved|tutti\s+i\s+diritti\s+riservati"
+    r"|tous\s+droits\s+r[eé]serv[eé]s|todos\s+los\s+derechos\s+reservados"
+    r"|alle\s+rechte\s+vorbehalten|todos\s+os\s+direitos\s+reservados"
+    # About the author
+    r"|about\s+the\s+author|sull['\u2019]?\s*autor[ei]|nota\s+sull['\u2019]?\s*autor[ei]"
+    r"|[àa]\s+propos\s+de\s+l['\u2019]?\s*auteur|sobre\s+el\s+autor"
+    r"|[üu]ber\s+d(?:en|ie)\s+autor(?:in)?|sobre\s+o\s+autor"
+    r"|gli\s+autori|les\s+auteurs|los\s+autores"
+    # Also by / other works
+    r"|also\s+by|dello\s+stesso\s+autor[ei]|du\s+m[êe]me\s+auteur"
+    r"|del\s+mismo\s+autor|vom\s+selben\s+autor|do\s+mesmo\s+autor"
+    r"|other\s+(?:books|works)\s+by|altre\s+opere"
+    # Author/editor notes (positioned here = back matter context)
+    r"|author['\u2019]?s?\s+note|editor['\u2019]?s?\s+note"
+    r"|nota\s+dell['\u2019]?\s*editor[ei]|note\s+de\s+l['\u2019]?\s*[eé]diteur"
+    # Interviews
+    r"|interview\s+with|intervista\s+con|entrevue\s+avec|entrevista\s+con"
+    # Colophon / credits / newsletter
+    r"|colophon|credits|crediti|newsletter|bonus\s+content"
+    # Reading guides / discussion
+    r"|reading\s+group\s+guide|discussion\s+(?:guide|questions)"
+    r"|guida\s+alla\s+lettura|gu[ií]a\s+de\s+lectura"
+    # Bibliography / references
+    r"|bibliography|bibliografia|bibliographie|bibliograf[ií]a"
+    # Glossary
+    r"|glossary|glossario|glossaire|glosario"
+    # Recipe sections (specific enough to be safe)
+    r"|ricettario|recipe\s+(?:from|index)|from\s+the\s+kitchen"
+    r"|ingredienti\s*$|ingredients\s*$"
+    r")\b",
+    re.MULTILINE,
+)
+
+# Filename keywords for EPUB items (supplements text detection)
+_BACK_MATTER_FILE_KEYWORDS = {
+    "acknowledgment", "acknowledgement", "afterword",
+    "backmatter", "back_matter", "back-matter",
+    "bibliography", "colophon", "credits",
+    "about_the_author", "about-the-author", "abouttheauthor",
+    "author_bio", "author-bio",
+    "also_by", "also-by", "alsoby", "other_books", "other-books",
+    "copyright", "legal", "imprint",
+    "newsletter", "signup", "bonus",
+    "interview", "intervista",
+    "glossary", "glossario",
+    "ringraziamenti", "remerciements", "agradecimientos",
+    "ricettario", "recipe",
+}
+
+
+def _is_back_matter_section(text: str, item_name: str = "") -> bool:
+    """
+    Check if a single section is back-matter.
+    Only called on tail sections (never on middle-of-book content).
+    """
+    # Check filename first (fast path)
+    if item_name:
+        name_lower = item_name.lower().replace(".", " ").replace("/", " ")
+        for kw in _BACK_MATTER_FILE_KEYWORDS:
+            if kw in name_lower:
+                return True
+
+    # Check text heading — use RAW text (not word-joined) to preserve line breaks
+    # for MULTILINE regex. First ~600 chars covers most headings.
+    opening = text[:600]
+    if _BACK_MATTER_HEADINGS.search(opening):
+        return True
+
+    return False
+
+
+def _is_story_section(text: str) -> bool:
+    """
+    Check if a section is definitively story content.
+    If True, we MUST stop trimming — this is narrative.
+    """
+    # Use raw text to preserve line breaks for MULTILINE regex
+    opening = text[:400]
+    return bool(_STORY_MARKERS.search(opening))
+
+
+def _trim_back_matter(pages: list[dict]) -> tuple[list[dict], list[str]]:
+    """
+    Scan backwards from the end of the book and remove back-matter sections.
+    Stops the moment it encounters story content.
+
+    Returns (filtered_pages, list_of_skipped_descriptions).
+
+    RULES:
+    - Scan from the last section backwards
+    - If a section is detected as back-matter → mark for removal, continue
+    - If a section looks like story content (chapter/epilogue markers) → STOP
+    - If a section is ambiguous (no back-matter signals, no story signals) → STOP
+      (conservative: we'd rather include non-story content than skip story)
+    - Never remove more than 40% of sections (safety cap)
+    """
+    if len(pages) < 3:
+        return pages, []
+
+    max_removable = max(1, int(len(pages) * 0.4))  # Safety cap
+    skipped = []
+    trim_from = len(pages)  # Index to trim from (exclusive)
+
+    for i in range(len(pages) - 1, -1, -1):
+        if len(pages) - trim_from >= max_removable:
+            break  # Safety cap reached
+
+        section = pages[i]
+        text = section["text"]
+        item_name = section.get("item_name", "")
+
+        # If this section has clear story markers, STOP — we've reached the narrative
+        if _is_story_section(text):
+            break
+
+        # If this section has clear back-matter signals, mark it for removal
+        if _is_back_matter_section(text, item_name):
+            trim_from = i
+            skipped.append(item_name or f"section {i+1} ({len(text.split())} words)")
+            continue
+
+        # Ambiguous section — no clear signals either way.
+        # STOP here. We'd rather include a recipe than skip a story chapter.
+        break
+
+    filtered = pages[:trim_from]
+    skipped.reverse()  # Put in forward order for logging
+    return filtered, skipped
+
+
 def extract_text(file_path: str) -> ExtractionResult:
     """
     Main entry point — detects file type and routes to the right extractor.
@@ -411,7 +580,7 @@ def extract_text_from_epub(epub_path: str) -> ExtractionResult:
     epub_meta = _extract_epub_metadata(book)
 
     # ── Extract text from each HTML chapter ───────────────────────────────
-    pages: list[dict] = []
+    raw_pages: list[dict] = []
     page_num = 0
 
     for item in book.get_items_of_type(ITEM_DOCUMENT):
@@ -429,9 +598,21 @@ def extract_text_from_epub(epub_path: str) -> ExtractionResult:
         text = soup.get_text(separator="\n", strip=True)
 
         # Skip near-empty sections (copyright pages, blank chapters, etc.)
-        if text.strip() and len(text.split()) > 20:
-            page_num += 1
-            pages.append({"page": page_num, "text": text})
+        if not text.strip() or len(text.split()) <= 20:
+            continue
+
+        item_name = getattr(item, "file_name", "") or getattr(item, "id", "") or ""
+        page_num += 1
+        raw_pages.append({"page": page_num, "text": text, "item_name": item_name})
+
+    # ── Trim back-matter from the tail ────────────────────────────────────
+    # Scans backwards from end, stops at first story section or ambiguous section
+    pages, skipped_back_matter = _trim_back_matter(raw_pages)
+
+    if skipped_back_matter:
+        logger.info(f"  Trimmed {len(skipped_back_matter)} back-matter section(s) "
+                     f"from end: {', '.join(skipped_back_matter)}")
+        warnings.append(f"Trimmed {len(skipped_back_matter)} back-matter section(s) from end")
 
     if not pages:
         warnings.append("No text extracted from EPUB")
