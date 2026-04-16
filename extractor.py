@@ -46,13 +46,15 @@ class TextChunk:
 
 @dataclass
 class PDFMetadata:
-    """Metadata extracted from PDF document properties."""
+    """Metadata extracted from PDF/EPUB document properties."""
     pdf_title: Optional[str] = None
     pdf_author: Optional[str] = None
     publisher: Optional[str] = None
     publish_year: Optional[int] = None
     creator: Optional[str] = None
     subject: Optional[str] = None
+    language: Optional[str] = None
+    isbn: Optional[str] = None
 
 
 @dataclass
@@ -99,78 +101,250 @@ CHAPTER_PATTERNS = [
 
 # Patterns that DEFINITIVELY mark a section as story content.
 # If we see any of these while scanning backwards, we STOP trimming immediately.
+# Multilingual: English, Italian, French, Spanish, Portuguese, German,
+#               Dutch, Swedish, Norwegian, Danish, Polish, Russian (transliterated)
 _STORY_MARKERS = re.compile(
     r"(?i)^\s*("
-    # Chapter markers (multilingual)
-    r"chapter\s+\w|capitolo\s+\w|chapitre\s+\w|cap[ií]tulo\s+\w|kapitel\s+\w"
-    r"|cap\.\s*\w"
-    # Part markers
-    r"|part\s+\w|parte\s+\w|partie\s+\w|teil\s+\w"
+    # Chapter markers
+    r"chapter\s+\w|capitolo\s+\w|chapitre\s+\w|cap[ií]tulo\s+\w"
+    r"|kapitel\s+\w|hoofdstuk\s+\w|kapittel\s+\w|kapitola\s+\w"
+    r"|rozdzia[lł]\s+\w|глава\s+\w"
+    r"|cap\.\s*\w|ch\.\s*\d|chap\.\s*\d"
+    # Part / book / volume markers
+    r"|part\s+\w|parte\s+\w|partie\s+\w|teil\s+\w|deel\s+\w|del\s+\w"
+    r"|book\s+(?:one|two|three|four|i|ii|iii|iv|v|\d)"
+    r"|volume\s+(?:one|two|i|ii|iii|\d)|libro\s+\w|livre\s+\w|buch\s+\w"
     # Numbered sections (1. / I. / 01.)
     r"|\d+\.\s+[A-Z]|[IVXLCDM]+\.\s+[A-Z]"
-    # Prologue/Epilogue markers (multilingual) — these ARE story content
-    r"|prologue|prologo|pr[oó]logo|prolog"
-    r"|epilogue|epilogo|ep[ií]logo|epilog"
+    # Prologue / Epilogue / Interlude (these ARE story content)
+    r"|prologue|prologo|pr[oó]logo|prolog|proloog|forspill"
+    r"|epilogue|epilogo|ep[ií]logo|epilog|epiloog|etterord"
+    r"|interlude|interludio|zwischenspiel"
+    # "The End" markers
+    r"|the\s+end\s*$|fin\s*$|fine\s*$|ende\s*$|fim\s*$|конец\s*$"
     r")\b",
     re.MULTILINE,
 )
 
 # High-confidence back-matter headings (multilingual).
-# These are terms that essentially NEVER appear as chapter titles in fiction
-# or non-fiction narrative. Each group covers: EN, IT, FR, ES, DE, PT
+# These are terms that essentially NEVER appear as chapter titles in narrative.
+# Languages: EN, IT, FR, ES, PT, DE, NL, SV, NO, DA, PL
 _BACK_MATTER_HEADINGS = re.compile(
     r"(?i)^\s*("
-    # Acknowledgments
+
+    # ── Acknowledgments / Thanks ───────────────────────────────────────────
     r"acknowledg[e]?ments?|ringraziamenti|remerciements|agradecimientos"
-    r"|danksagung|agradecimentos"
-    # Copyright / legal
-    r"|copyright|all\s+rights\s+reserved|tutti\s+i\s+diritti\s+riservati"
-    r"|tous\s+droits\s+r[eé]serv[eé]s|todos\s+los\s+derechos\s+reservados"
-    r"|alle\s+rechte\s+vorbehalten|todos\s+os\s+direitos\s+reservados"
-    # About the author
-    r"|about\s+the\s+author|sull['\u2019]?\s*autor[ei]|nota\s+sull['\u2019]?\s*autor[ei]"
-    r"|[àa]\s+propos\s+de\s+l['\u2019]?\s*auteur|sobre\s+el\s+autor"
-    r"|[üu]ber\s+d(?:en|ie)\s+autor(?:in)?|sobre\s+o\s+autor"
-    r"|gli\s+autori|les\s+auteurs|los\s+autores"
-    # Also by / other works
-    r"|also\s+by|dello\s+stesso\s+autor[ei]|du\s+m[êe]me\s+auteur"
-    r"|del\s+mismo\s+autor|vom\s+selben\s+autor|do\s+mesmo\s+autor"
-    r"|other\s+(?:books|works)\s+by|altre\s+opere"
-    # Author/editor notes (positioned here = back matter context)
-    r"|author['\u2019]?s?\s+note|editor['\u2019]?s?\s+note"
-    r"|nota\s+dell['\u2019]?\s*editor[ei]|note\s+de\s+l['\u2019]?\s*[eé]diteur"
-    # Interviews
-    r"|interview\s+with|intervista\s+con|entrevue\s+avec|entrevista\s+con"
-    # Colophon / credits / newsletter
-    r"|colophon|credits|crediti|newsletter|bonus\s+content"
-    # Reading guides / discussion
-    r"|reading\s+group\s+guide|discussion\s+(?:guide|questions)"
-    r"|guida\s+alla\s+lettura|gu[ií]a\s+de\s+lectura"
-    # Bibliography / references
+    r"|agradecimentos|danksagung|dankwoord|tacks[äa]gelse|takksigelser"
+    r"|podzi[eę]kowania"
+
+    # ── Copyright / Legal / Imprint ────────────────────────────────────────
+    r"|copyright|all\s+rights\s+reserved"
+    r"|tutti\s+i\s+diritti\s+riservati|nota\s+di\s+copyright"
+    r"|tous\s+droits\s+r[eé]serv[eé]s|mentions\s+l[eé]gales"
+    r"|todos\s+los\s+derechos\s+reservados|aviso\s+legal"
+    r"|todos\s+os\s+direitos\s+reservados"
+    r"|alle\s+rechte\s+vorbehalten|impressum|urheberrecht"
+    r"|alle\s+rechten\s+voorbehouden|colofoon"
+    r"|wszelkie\s+prawa\s+zastrze[zż]one"
+
+    # ── About the author / Author bio ──────────────────────────────────────
+    r"|about\s+the\s+author[s]?|author\s+bio(?:graphy)?"
+    r"|sull['\u2019]?\s*autor[ei]|nota\s+sull['\u2019]?\s*autor[ei]"
+    r"|biografia\s+dell['\u2019]?\s*autor[ei]|gli\s+autori|l['\u2019]?\s*autore"
+    r"|[àa]\s+propos\s+de\s+l['\u2019]?\s*auteur|biographie\s+de\s+l['\u2019]?\s*auteur"
+    r"|les\s+auteurs"
+    r"|sobre\s+el\s+autor|acerca\s+del\s+autor|biograf[ií]a\s+del\s+autor"
+    r"|los\s+autores"
+    r"|sobre\s+o\s+autor|biografia\s+do\s+autor"
+    r"|[üu]ber\s+d(?:en|ie)\s+autor(?:in)?|biografie\s+des\s+autors"
+    r"|over\s+de\s+auteur|om\s+f[öo]rfattaren"
+
+    # ── Also by / Other works ──────────────────────────────────────────────
+    r"|also\s+by|other\s+(?:books|works|titles)\s+by|by\s+the\s+same\s+author"
+    r"|dello\s+stesso\s+autor[ei]|altre\s+opere|nello\s+stesso\s+catalogo"
+    r"|du\s+m[êe]me\s+auteur|du\s+m[êe]me\s+[eé]diteur"
+    r"|del\s+mismo\s+autor|otros\s+t[ií]tulos|otras\s+obras"
+    r"|do\s+mesmo\s+autor"
+    r"|vom\s+selben\s+autor|weitere\s+b[üu]cher"
+    r"|van\s+dezelfde\s+auteur"
+
+    # ── Author/editor notes (positioned at end = back matter) ──────────────
+    r"|author['\u2019]?s?\s+note|editor['\u2019]?s?\s+note|translator['\u2019]?s?\s+note"
+    r"|nota\s+(?:dell['\u2019]?\s*autor|dell['\u2019]?\s*editor|del\s+traduttor)[ei]"
+    r"|note\s+de\s+l['\u2019]?\s*(?:auteur|[eé]diteur|traducteur)"
+    r"|nota\s+del\s+(?:autor|editor|traductor)"
+    r"|anmerkung\s+des\s+(?:autors|herausgebers|[üu]bersetzers)"
+
+    # ── Interviews ─────────────────────────────────────────────────────────
+    r"|interview\s+with|intervista\s+(?:con|a)|entretien\s+avec"
+    r"|entrevista\s+(?:con|a)|entrevista\s+com"
+    r"|gespr[äa]ch\s+mit|interview\s+met"
+    r"|q\s*[&y]\s*a\s+with|q\s+and\s+a"
+
+    # ── Forewords / Introductions / Prefaces (back-matter when at end) ─────
+    # Note: only flagged when at END of book — front-matter scan untouched
+    r"|afterword|postface|postfazione|epil[oó]go\s+del\s+autor|nachwort"
+    r"|nawoord|etterord|efterord|posłowie"
+
+    # ── Colophon / Credits / Newsletter / Bonus ────────────────────────────
+    r"|colophon|colofon|colof[oó]n|kolofon"
+    r"|credits|crediti|cr[eé]ditos|generique"
+    r"|newsletter|mailing\s+list|join\s+(?:the|our)\s+newsletter"
+    r"|bonus\s+content|extras|contenu(?:s)?\s+bonus"
+    r"|continue\s+reading|keep\s+reading"
+    r"|sneak\s+peek|sneak\s+preview|preview\s+of"
+    r"|excerpt\s+from|extrait\s+de|estratto\s+da"
+    r"|coming\s+soon|prossimamente|pr[oó]ximamente|bient[oô]t"
+
+    # ── Reading guides / Discussion / Book club ────────────────────────────
+    r"|reading\s+group\s+guide|book\s+club\s+guide"
+    r"|discussion\s+(?:guide|questions)|questions\s+for\s+discussion"
+    r"|guida\s+alla\s+lettura|gruppo\s+di\s+lettura"
+    r"|gu[ií]a\s+de\s+lectura|preguntas\s+para\s+la\s+discusi[oó]n"
+    r"|guide\s+de\s+lecture|club\s+de\s+lecture"
+    r"|leitfaden\s+f[üu]r\s+lesegruppen"
+
+    # ── Bibliography / References / Sources / Notes ────────────────────────
     r"|bibliography|bibliografia|bibliographie|bibliograf[ií]a"
-    # Glossary
-    r"|glossary|glossario|glossaire|glosario"
-    # Recipe sections (specific enough to be safe)
-    r"|ricettario|recipe\s+(?:from|index)|from\s+the\s+kitchen"
-    r"|ingredienti\s*$|ingredients\s*$"
+    r"|references|referencias|r[eé]f[eé]rences|riferimenti"
+    r"|sources|fonti|fuentes|quellen"
+    r"|works\s+cited|opere\s+citate|obras\s+citadas"
+    r"|endnotes|footnotes|notes\s+on\s+sources|note\s+(?:al\s+)?testo"
+
+    # ── Index / Glossary / Appendix ────────────────────────────────────────
+    r"|^\s*index\s*$|^\s*indice\s*$|^\s*[íi]ndice\s*$|^\s*sachregister\s*$"
+    r"|glossary|glossario|glossaire|glosario|gloss[áa]rio|glossar"
+    r"|appendix|appendi(?:ce|ces|x)|apendice|ap[eê]ndice|anhang"
+
+    # ── About the publisher / Imprint ──────────────────────────────────────
+    r"|about\s+the\s+publisher|sull['\u2019]?\s*editor[ei]"
+    r"|acerca\s+del\s+editor|sobre\s+a\s+editora"
+    r"|[üu]ber\s+den\s+verlag"
+
+    # ── Recipe sections (end-of-book bonus) ────────────────────────────────
+    r"|ricettario|ricette|recipe(?:s)?\s+(?:from|index|section)|from\s+the\s+kitchen"
+    r"|ingredienti\s*$|ingredients\s*$|recettes|recetas|rezepte"
+
+    # ── Maps / Character lists (when at end as reference) ──────────────────
+    r"|cast\s+of\s+characters|dramatis\s+personae|character\s+list"
+    r"|elenco\s+dei\s+personaggi|personaggi\s+principali"
+    r"|liste\s+des\s+personnages|personajes\s+principales"
+
+    # ── Translator info ────────────────────────────────────────────────────
+    r"|about\s+the\s+translator|sul\s+traduttore|sobre\s+el\s+traductor"
+
+    # ── Reviews / Praise / Blurbs (often at end too) ───────────────────────
+    r"|praise\s+for|reviews\s+of|critica\s+per|elogi\s+per"
+    r"|lo\s+han\s+dicho|han\s+dit"
+
+    # ── Meet the author / Author Q&A ───────────────────────────────────────
+    r"|meet\s+the\s+author|conoce\s+al\s+autor|incontra\s+l['\u2019]?\s*autore"
+
+    # ── Title pages / divider / blank-style markers (rare but seen) ────────
+    r"|^\s*pagine\s+(?:da\s+riempire|bianche)\s*$"
+    r"|^\s*pages?\s+blanches?\s*$"
+    r"|^\s*p[áa]ginas?\s+(?:en\s+blanco|para\s+rellenar)\s*$"
+    r"|^\s*blank\s+pages?\s*$"
+
     r")\b",
     re.MULTILINE,
 )
 
-# Filename keywords for EPUB items (supplements text detection)
+# Filename keywords for EPUB items (supplements text detection).
+# These are matched as substrings in normalized filenames.
+# Keep them long enough to avoid false positives — minimum 5 chars typically.
 _BACK_MATTER_FILE_KEYWORDS = {
-    "acknowledgment", "acknowledgement", "afterword",
+    # Acknowledgments (multilingual roots)
+    "acknowledgment", "acknowledgement", "acknowledgments", "acknowledgements",
+    "ringraziamenti", "ringraziament",
+    "remerciements", "remerciement",
+    "agradecimientos", "agradecimiento",
+    "agradecimentos", "agradecimento",
+    "danksagung", "dankwoord",
+    "podziekowania", "podziękowania",
+    "thanks_to", "thank_you",
+
+    # Afterword / Postscript
+    "afterword", "afterwords",
+    "postface", "postfazione", "posfacio", "nawoord", "nachwort",
+    "etterord", "efterord", "poslowie",
+
+    # Back matter generic
     "backmatter", "back_matter", "back-matter",
-    "bibliography", "colophon", "credits",
+    "endmatter", "end_matter", "end-matter",
+    "frontmatter",  # Sometimes mislabeled
+
+    # Bibliography / References
+    "bibliography", "bibliografia", "bibliographie", "bibliografie",
+    "references", "referencias", "riferimenti",
+
+    # Colophon / Credits / Imprint
+    "colophon", "colofon", "kolofon",
+    "credits", "crediti", "creditos", "credito",
+    "imprint", "impressum", "frontespizio_legale",
+
+    # About the author
     "about_the_author", "about-the-author", "abouttheauthor",
-    "author_bio", "author-bio",
-    "also_by", "also-by", "alsoby", "other_books", "other-books",
-    "copyright", "legal", "imprint",
-    "newsletter", "signup", "bonus",
-    "interview", "intervista",
-    "glossary", "glossario",
-    "ringraziamenti", "remerciements", "agradecimientos",
-    "ricettario", "recipe",
+    "about_author", "aboutauthor",
+    "author_bio", "author-bio", "authorbio",
+    "biografia", "biografie",
+    "gli_autori", "gli-autori", "lautore", "l_autore",
+    "sobre_el_autor", "sobre_o_autor",
+    "about_the_translator", "about_the_publisher",
+
+    # Also by
+    "also_by", "also-by", "alsoby",
+    "other_books", "other-books", "otherbooks",
+    "other_works", "otherworks",
+    "altre_opere", "altreopere",
+    "dello_stesso", "dellostesso",
+    "del_mismo_autor",
+
+    # Copyright / Legal
+    "copyright", "_legal", "/legal", "copyrightpage",
+
+    # Newsletter / Marketing
+    "newsletter", "signup", "sign_up", "mailinglist", "mailing_list",
+    "bonus", "bonuscontent", "bonus_content",
+    "preview", "sneak_peek", "sneakpeek",
+    "extras",
+
+    # Interview / Q&A
+    "interview", "intervista", "entrevista", "entretien", "gespraech",
+    "q_and_a", "qanda", "qa_with",
+
+    # Glossary / Index / Appendix
+    "glossary", "glossario", "glossaire", "glosario", "glossar",
+    "appendix", "appendice", "apendice", "anhang",
+    # Note: "index" alone is too short and conflicts with index.html
+    # We use index.htm/html separately below
+
+    # Reading guide / Discussion
+    "readinggroup", "reading_group", "readingguide", "reading_guide",
+    "bookclub", "book_club",
+    "discussion", "discussionguide",
+    "guida_lettura", "guidalettura",
+
+    # Recipe sections
+    "ricettario", "ricetta", "ricette",
+    "recipe", "recipes", "recetas", "recettes", "rezepte",
+
+    # Cast / Characters list (end-of-book reference)
+    "dramatis_personae", "dramatispersonae",
+    "cast_of_characters", "castofcharacters",
+    "character_list", "characterlist",
+    "personaggi",
+
+    # The End markers (rare as filenames but worth including)
+    "the_end", "theend", "thend",
+    "fine_libro", "finelibro",
+}
+
+# Filenames that look like generic landing pages (often back matter)
+# These are EXACT or strict-prefix matches, not substring
+_BACK_MATTER_EXACT_FILENAMES = {
+    "index.html", "index.xhtml", "index.htm",
+    "toc.html", "toc.xhtml",  # Table of contents at end is unusual but possible
 }
 
 
@@ -178,12 +352,28 @@ def _is_back_matter_section(text: str, item_name: str = "") -> bool:
     """
     Check if a single section is back-matter.
     Only called on tail sections (never on middle-of-book content).
+
+    Detection signals (any one is enough):
+    1. Filename matches an exact back-matter filename
+    2. Filename contains a back-matter keyword as a substring
+    3. Section text starts with a back-matter heading
     """
-    # Check filename first (fast path)
     if item_name:
-        name_lower = item_name.lower().replace(".", " ").replace("/", " ")
+        # Get just the filename part if path-like
+        base_name = item_name.lower().rsplit("/", 1)[-1].rsplit("\\", 1)[-1]
+
+        # Exact filename match (e.g. "index.html")
+        if base_name in _BACK_MATTER_EXACT_FILENAMES:
+            return True
+
+        # Substring keyword match against normalized filename
+        # Normalize: replace separators with spaces for word-boundary safety
+        name_normalized = base_name.replace(".", " ").replace("_", " ").replace("-", " ")
+        # Also keep an underscore version for keywords that use underscores
+        name_with_separators = item_name.lower()
         for kw in _BACK_MATTER_FILE_KEYWORDS:
-            if kw in name_lower:
+            # Try both normalized and raw forms (some keywords have underscores)
+            if kw in name_with_separators or kw.replace("_", " ") in name_normalized:
                 return True
 
     # Check text heading — use RAW text (not word-joined) to preserve line breaks
@@ -216,16 +406,22 @@ def _trim_back_matter(pages: list[dict]) -> tuple[list[dict], list[str]]:
     - Scan from the last section backwards
     - If a section is detected as back-matter → mark for removal, continue
     - If a section looks like story content (chapter/epilogue markers) → STOP
-    - If a section is ambiguous (no back-matter signals, no story signals) → STOP
+    - If a section is ambiguous BUT very short (< 100 words) AND we've already
+      trimmed at least one confirmed back-matter section → treat as a divider
+      page / title card and trim it too (continue scanning)
+    - If a section is ambiguous with substantial content → STOP
       (conservative: we'd rather include non-story content than skip story)
     - Never remove more than 40% of sections (safety cap)
     """
     if len(pages) < 3:
         return pages, []
 
+    TAIL_MIN_WORDS = 100  # Ambiguous sections below this are treated as divider pages
+
     max_removable = max(1, int(len(pages) * 0.4))  # Safety cap
     skipped = []
     trim_from = len(pages)  # Index to trim from (exclusive)
+    confirmed_back_matter = 0  # How many confirmed back-matter sections we've trimmed
 
     for i in range(len(pages) - 1, -1, -1):
         if len(pages) - trim_from >= max_removable:
@@ -234,6 +430,7 @@ def _trim_back_matter(pages: list[dict]) -> tuple[list[dict], list[str]]:
         section = pages[i]
         text = section["text"]
         item_name = section.get("item_name", "")
+        word_count = len(text.split())
 
         # If this section has clear story markers, STOP — we've reached the narrative
         if _is_story_section(text):
@@ -242,11 +439,21 @@ def _trim_back_matter(pages: list[dict]) -> tuple[list[dict], list[str]]:
         # If this section has clear back-matter signals, mark it for removal
         if _is_back_matter_section(text, item_name):
             trim_from = i
-            skipped.append(item_name or f"section {i+1} ({len(text.split())} words)")
+            confirmed_back_matter += 1
+            skipped.append(item_name or f"section {i+1} ({word_count} words)")
             continue
 
         # Ambiguous section — no clear signals either way.
-        # STOP here. We'd rather include a recipe than skip a story chapter.
+        # If it's very short AND we've already confirmed back-matter after it,
+        # it's almost certainly a divider page / title card (not story content).
+        if word_count < TAIL_MIN_WORDS and confirmed_back_matter > 0:
+            trim_from = i
+            skipped.append(
+                f"{item_name or f'section {i+1}'} ({word_count} words, low-content)")
+            continue
+
+        # Ambiguous section with substantial content — STOP.
+        # We'd rather include non-story content than risk skipping story.
         break
 
     filtered = pages[:trim_from]
@@ -703,6 +910,8 @@ def _extract_epub_metadata(book) -> PDFMetadata:
     author = None
     publisher = None
     publish_year = None
+    language = None
+    isbn = None
 
     # Title
     try:
@@ -741,6 +950,34 @@ def _extract_epub_metadata(book) -> PDFMetadata:
     except Exception:
         pass
 
+    # Language (e.g. "en", "it", "fr", "en-US")
+    try:
+        languages = book.get_metadata("DC", "language")
+        if languages:
+            language = languages[0][0].strip()
+    except Exception:
+        pass
+
+    # ISBN — stored in DC:identifier, often prefixed with "isbn:" or "urn:isbn:"
+    try:
+        identifiers = book.get_metadata("DC", "identifier")
+        for ident in identifiers:
+            val = ident[0].strip() if ident[0] else ""
+            # Check for ISBN prefix
+            val_lower = val.lower()
+            if "isbn" in val_lower:
+                # Extract just the digits/hyphens
+                isbn_match = re.search(r"(\d[\d\-]{8,16}\d)", val)
+                if isbn_match:
+                    isbn = isbn_match.group(1)
+                    break
+            # Also check raw value — some EPUBs just put the ISBN as the identifier
+            elif re.match(r"^(97[89])?\d{9}[\dXx]$", val.replace("-", "")):
+                isbn = val
+                break
+    except Exception:
+        pass
+
     return PDFMetadata(
         pdf_title=title,
         pdf_author=author,
@@ -748,6 +985,8 @@ def _extract_epub_metadata(book) -> PDFMetadata:
         publish_year=publish_year,
         creator=None,
         subject=None,
+        language=language,
+        isbn=isbn,
     )
 
 

@@ -624,6 +624,7 @@ class BookMetadata(BaseModel):
     publisher: Optional[str] = Field(default=None)
     publish_year: Optional[int] = Field(default=None)
     language: str = Field(default="English")
+    isbn: Optional[str] = Field(default=None)
 
 class BookAnalysis(BaseModel):
     metadata: BookMetadata

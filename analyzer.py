@@ -304,6 +304,53 @@ _VALID_SETTING = {s.value for s in SettingType}
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
+# LANGUAGE RESOLUTION
+# ═══════════════════════════════════════════════════════════════════════════════
+
+_LANGUAGE_MAP = {
+    "en": "English", "eng": "English",
+    "it": "Italian", "ita": "Italian",
+    "fr": "French", "fre": "French", "fra": "French",
+    "es": "Spanish", "spa": "Spanish",
+    "de": "German", "ger": "German", "deu": "German",
+    "pt": "Portuguese", "por": "Portuguese",
+    "nl": "Dutch", "nld": "Dutch", "dut": "Dutch",
+    "sv": "Swedish", "swe": "Swedish",
+    "no": "Norwegian", "nor": "Norwegian",
+    "da": "Danish", "dan": "Danish",
+    "fi": "Finnish", "fin": "Finnish",
+    "pl": "Polish", "pol": "Polish",
+    "ru": "Russian", "rus": "Russian",
+    "ja": "Japanese", "jpn": "Japanese",
+    "zh": "Chinese", "zho": "Chinese", "chi": "Chinese",
+    "ko": "Korean", "kor": "Korean",
+    "ar": "Arabic", "ara": "Arabic",
+    "hi": "Hindi", "hin": "Hindi",
+    "tr": "Turkish", "tur": "Turkish",
+    "el": "Greek", "gre": "Greek", "ell": "Greek",
+    "he": "Hebrew", "heb": "Hebrew",
+    "ro": "Romanian", "ron": "Romanian", "rum": "Romanian",
+    "cs": "Czech", "ces": "Czech", "cze": "Czech",
+    "hu": "Hungarian", "hun": "Hungarian",
+    "uk": "Ukrainian", "ukr": "Ukrainian",
+    "th": "Thai", "tha": "Thai",
+    "vi": "Vietnamese", "vie": "Vietnamese",
+    "id": "Indonesian", "ind": "Indonesian",
+    "ms": "Malay", "msa": "Malay", "may": "Malay",
+    "la": "Latin", "lat": "Latin",
+}
+
+
+def _resolve_language(lang_code: str | None) -> str:
+    """Convert language code (e.g. 'it', 'en-US') to full name. Defaults to English."""
+    if not lang_code:
+        return "English"
+    # Handle codes like "en-US", "pt-BR" — take just the base
+    base = lang_code.strip().split("-")[0].split("_")[0].lower()
+    return _LANGUAGE_MAP.get(base, lang_code.strip())
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
 # MAPPING TABLES
 # ═══════════════════════════════════════════════════════════════════════════════
 
@@ -833,7 +880,9 @@ def aggregate_analysis(chunk_analyses, holistic, extraction):
         book_type=holistic.book_type, genre=holistic.genre,
         sub_genres=holistic.sub_genres,
         publisher=extraction.pdf_metadata.publisher,
-        publish_year=extraction.pdf_metadata.publish_year)
+        publish_year=extraction.pdf_metadata.publish_year,
+        language=_resolve_language(extraction.pdf_metadata.language),
+        isbn=extraction.pdf_metadata.isbn)
 
     ratings = ContentRatings(
         tone=wavg(lambda c: c.tone),
@@ -1344,7 +1393,9 @@ def aggregate_analysis_fast(slim_analyses, holistic, extraction):
         book_type=holistic.book_type, genre=holistic.genre,
         sub_genres=holistic.sub_genres,
         publisher=extraction.pdf_metadata.publisher,
-        publish_year=extraction.pdf_metadata.publish_year)
+        publish_year=extraction.pdf_metadata.publish_year,
+        language=_resolve_language(extraction.pdf_metadata.language),
+        isbn=extraction.pdf_metadata.isbn)
 
     ratings = ContentRatings(
         tone=wavg(lambda c: c.tone),
