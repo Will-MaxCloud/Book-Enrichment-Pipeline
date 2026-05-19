@@ -5,10 +5,13 @@ Modes:
     DEFAULT (quality): Full Pass 1 (Sonnet) + Pass 2 (Sonnet)
     --fast:            Slim Pass 1 (Haiku) + Rich Pass 2 (Sonnet)
                        ~10x cheaper, ~3x faster
+    --faster:          Slim Pass 1 (Haiku) + Rich Pass 2 (Haiku)  [EXPERIMENTAL]
+                       ~30x cheaper, ~5x faster — quality may vary
 
 Usage:
     python run_analysis.py /path/to/book.pdf
     python run_analysis.py /path/to/book.pdf --fast
+    python run_analysis.py /path/to/book.pdf --faster
     python run_analysis.py /path/to/books/ --batch --fast
     python run_analysis.py /path/to/book.pdf --fast --p1-model claude-haiku-4-5-20251001
 
@@ -31,8 +34,10 @@ from pathlib import Path
 from extractor import extract_text
 from analyzer import (
     AnalysisClient, aggregate_analysis, aggregate_analysis_fast,
+    promote_memoir_protagonist,
 )
 from schemas import BookAnalysis, ChunkAnalysis, SlimChunkAnalysis
+from profiler import Profiler, StageTiming, aggregate_batch_profiles
 
 logging.basicConfig(
     level=logging.INFO,
@@ -49,13 +54,26 @@ def analyze_book(
     p1_model: str = "claude-sonnet-4-20250514",
     p2_model: str = "claude-sonnet-4-20250514",
     fast_mode: bool = False,
+    faster_mode: bool = False,
 ) -> BookAnalysis:
-    """Full pipeline: PDF → Extract → Pass 1 → Pass 2 → JSON."""
+    """Full pipeline: PDF → Extract → Pass 1 → Pass 2 → JSON.
+
+    Modes (mutually exclusive — faster takes precedence if both set):
+      QUALITY (default):  Sonnet for both passes
+      FAST:               Haiku Pass 1 + Sonnet Pass 2
+      FASTER:             Haiku for both passes (experimental, max savings)
+    """
     pdf_path = os.path.abspath(pdf_path)
     pdf_name = Path(pdf_path).stem
     start_time = time.time()
 
-    mode_label = "FAST" if fast_mode else "QUALITY"
+    if faster_mode:
+        mode_label = "FASTER"
+    elif fast_mode:
+        mode_label = "FAST"
+    else:
+        mode_label = "QUALITY"
+
     logger.info(f"{'═'*60}")
     logger.info(f"  ANALYZING [{mode_label}]: {pdf_name}")
     logger.info(f"  Pass 1: {p1_model.split('-')[1] if '-' in p1_model else p1_model}")
@@ -82,10 +100,23 @@ def analyze_book(
 
     client = AnalysisClient(api_key=api_key, model=p1_model, p2_model=p2_model)
 
-    if fast_mode:
-        result = _run_fast_pipeline(client, extraction, book_context)
+    # ── Profiler setup ────────────────────────────────────────────────────
+    profiler = Profiler(book_name=pdf_name, mode=mode_label)
+    client.attach_profiler(profiler)
+
+    # Extraction is non-API but we still time it as a stage.
+    # Note: extraction was already done above before client creation; we
+    # record it as a synthetic stage with the elapsed time so far.
+    extraction_elapsed = time.time() - start_time
+    profiler.stages.append(StageTiming(
+        name="extraction", duration_seconds=round(extraction_elapsed, 3)))
+
+    if faster_mode:
+        result = _run_faster_pipeline(client, extraction, book_context, profiler)
+    elif fast_mode:
+        result = _run_fast_pipeline(client, extraction, book_context, profiler)
     else:
-        result = _run_quality_pipeline(client, extraction, book_context)
+        result = _run_quality_pipeline(client, extraction, book_context, profiler)
 
     # ── Save ──────────────────────────────────────────────────────────────
     if output_dir is None:
@@ -96,6 +127,14 @@ def analyze_book(
 
     with open(output_path, "w", encoding="utf-8") as f:
         json.dump(result.model_dump(), f, indent=2, ensure_ascii=False, default=str)
+
+    # ── Save profiler sidecar ─────────────────────────────────────────────
+    profiler.finalize()
+    profile_path = os.path.join(output_dir, f"{pdf_name}_profile.json")
+    try:
+        profiler.save(profile_path)
+    except Exception as e:
+        logger.warning(f"Failed to save profile sidecar: {e}")
 
     elapsed = time.time() - start_time
 
@@ -121,22 +160,27 @@ def analyze_book(
     logger.info(f"  Sad ending:   {result.sad_ending}")
     logger.info(f"  Flags:        {', '.join(f.value if hasattr(f, 'value') else str(f) for f in result.content_flags)}")
     logger.info(f"  Read time:    {result.computed_stats.estimated_read_time_hours:.1f}h")
+    logger.info(f"{'─'*60}")
+    logger.info(f"  PROFILE → {profile_path}")
+    for line in profiler.summary_lines():
+        logger.info(line)
     logger.info(f"{'═'*60}")
 
     return result
 
 
-def _run_quality_pipeline(client, extraction, book_context):
+def _run_quality_pipeline(client, extraction, book_context, profiler=None):
     """Full Pass 1 (all fields) + Pass 2."""
     logger.info(f"STEP 2/4 · Pass 1 [QUALITY]: Analyzing {len(extraction.chunks)} chunks...")
 
+    if profiler: profiler.start_stage("pass1")
     chunk_analyses = []
     failed = []
 
     for i, chunk in enumerate(extraction.chunks):
         logger.info(f"  [{i+1}/{len(extraction.chunks)}] {chunk.label} ({chunk.word_count:,} words)")
         try:
-            analysis = client.analyze_chunk(chunk, book_context)
+            analysis = client.analyze_chunk(chunk, book_context, tag=f"p1_chunk_{i+1}")
             logger.info(
                 f"         → themes: {len(analysis.themes_detected)}, "
                 f"chars: {len(analysis.characters_present)}, "
@@ -147,6 +191,7 @@ def _run_quality_pipeline(client, extraction, book_context):
             failed.append(i)
         if i < len(extraction.chunks) - 1:
             time.sleep(0.5)
+    if profiler: profiler.end_stage("pass1")
 
     if not chunk_analyses:
         logger.error("All chunks failed.")
@@ -154,34 +199,76 @@ def _run_quality_pipeline(client, extraction, book_context):
     if failed:
         logger.warning(f"  {len(failed)} chunks failed — proceeding with {len(chunk_analyses)}")
 
+    # ── Detection (Session B): fiction or non-fiction? ────────────────────
+    if profiler: profiler.start_stage("detection")
+    book_type = client.detect_book_type(extraction)
+    if profiler: profiler.end_stage("detection")
+    logger.info(f"  [detection] Book classified as: {book_type}")
+
     logger.info("STEP 3/4 · Pass 2 [QUALITY]: Holistic analysis...")
+    if profiler: profiler.start_stage("pass2")
     holistic = client.analyze_holistic(chunk_analyses, extraction)
+    if profiler: profiler.end_stage("pass2")
     logger.info(f"  → Genre: {holistic.genre.value}")
 
     logger.info("STEP 4/4 · Aggregating...")
-    return aggregate_analysis(chunk_analyses, holistic, extraction)
+    if profiler: profiler.start_stage("aggregation")
+    result = aggregate_analysis(chunk_analyses, holistic, extraction)
+    if profiler: profiler.end_stage("aggregation")
+
+    # ── Non-fiction Pass 2 (Session C): populate NonFictionInfo ──────────
+    if book_type == "non_fiction":
+        if profiler: profiler.start_stage("p2_nonfic")
+        logger.info(f"  [non-fic] Running non-fiction Pass 2...")
+        result.non_fiction_info = client.analyze_holistic_nonfic(chunk_analyses, extraction)
+        if profiler: profiler.end_stage("p2_nonfic")
+        nfi = result.non_fiction_info
+        logger.info(f"  [non-fic] Sub-type: {nfi.sub_type.value}, audience: {nfi.target_audience.value}, structure: {nfi.structure_type.value}")
+        logger.info(f"  [non-fic] Thesis: {nfi.thesis[:80]}...")
+
+        # If this is a first-person memoir/autobiography, ensure the author
+        # (= the first-person narrator) is ranked as the primary character.
+        # Fixes a structural issue where mention-counting alone ranks people
+        # the author talks ABOUT above the author themselves.
+        result = promote_memoir_protagonist(result, extraction)
 
 
-def _run_fast_pipeline(client, extraction, book_context):
+    return result
+
+
+def _run_fast_pipeline(client, extraction, book_context, profiler=None):
     """Slim Pass 1 (scores only, Haiku) + Rich Pass 2 (Sonnet)."""
+    # ── Detection FIRST so Pass 1 can branch its prompt for non-fiction ──
+    # Memoirs/biographies need different character-extraction guidance than
+    # novels (real people vs. fictional characters; narrator=author).
+    if profiler: profiler.start_stage("detection")
+    book_type = client.detect_book_type(extraction)
+    if profiler: profiler.end_stage("detection")
+    logger.info(f"  [detection] Book classified as: {book_type}")
+
     logger.info(f"STEP 2/4 · Pass 1 [FAST]: Scoring {len(extraction.chunks)} chunks...")
 
+    if profiler: profiler.start_stage("pass1")
     slim_analyses = []
     failed = []
 
     for i, chunk in enumerate(extraction.chunks):
         logger.info(f"  [{i+1}/{len(extraction.chunks)}] {chunk.label} ({chunk.word_count:,} words)")
         try:
-            analysis = client.analyze_chunk_slim(chunk, book_context)
+            analysis = client.analyze_chunk_slim(
+                chunk, book_context, tag=f"p1_chunk_{i+1}", book_type=book_type)
             logger.info(
-                f"         → tone:{analysis.tone} pace:{analysis.pace} "
-                f"violence:{analysis.violence} chars:{len(analysis.character_names)}")
+                f"         → tone:{analysis.tone} read:{analysis.readability} "
+                f"viol:{analysis.violence} pace:{analysis.pace} "
+                f"world:{analysis.worldbuilding} hum:{analysis.humor} "
+                f"rom:{analysis.romance} chars:{len(analysis.character_names)}")
             slim_analyses.append(analysis)
         except Exception as e:
             logger.error(f"  ✗ Chunk {i} failed: {e}")
             failed.append(i)
         if i < len(extraction.chunks) - 1:
             time.sleep(0.3)  # Shorter delay for faster model
+    if profiler: profiler.end_stage("pass1")
 
     if not slim_analyses:
         logger.error("All chunks failed.")
@@ -189,14 +276,124 @@ def _run_fast_pipeline(client, extraction, book_context):
     if failed:
         logger.warning(f"  {len(failed)} chunks failed — proceeding with {len(slim_analyses)}")
 
+    # (Detection already happened before Pass 1 — book_type is in scope.)
+
     logger.info("STEP 3/4 · Pass 2 [FAST → SONNET]: Full analysis...")
+    if profiler: profiler.start_stage("pass2")
     holistic = client.analyze_holistic_fast(slim_analyses, extraction)
+    if profiler: profiler.end_stage("pass2")
     logger.info(f"  → Genre: {holistic.genre.value}")
     logger.info(f"  → Themes: {len(holistic.ranked_themes)}")
     logger.info(f"  → Characters: {len(holistic.ranked_characters)}")
 
     logger.info("STEP 4/4 · Aggregating...")
-    return aggregate_analysis_fast(slim_analyses, holistic, extraction)
+    if profiler: profiler.start_stage("aggregation")
+    result = aggregate_analysis_fast(slim_analyses, holistic, extraction)
+    if profiler: profiler.end_stage("aggregation")
+
+    # ── Non-fiction Pass 2 (Session C): populate NonFictionInfo ──────────
+    # For non-fiction books, attach a placeholder NonFictionInfo so the
+    # BookAnalysis JSON has the field populated. Session C replaces the
+    # stub with a real Pass 2 prompt result.
+    if book_type == "non_fiction":
+        if profiler: profiler.start_stage("p2_nonfic")
+        logger.info(f"  [non-fic] Running non-fiction Pass 2...")
+        result.non_fiction_info = client.analyze_holistic_nonfic(slim_analyses, extraction)
+        if profiler: profiler.end_stage("p2_nonfic")
+        nfi = result.non_fiction_info
+        logger.info(f"  [non-fic] Sub-type: {nfi.sub_type.value}, audience: {nfi.target_audience.value}, structure: {nfi.structure_type.value}")
+        logger.info(f"  [non-fic] Thesis: {nfi.thesis[:80]}...")
+
+        # If this is a first-person memoir/autobiography, ensure the author
+        # (= the first-person narrator) is ranked as the primary character.
+        # Fixes a structural issue where mention-counting alone ranks people
+        # the author talks ABOUT above the author themselves.
+        result = promote_memoir_protagonist(result, extraction)
+
+
+    return result
+
+
+def _run_faster_pipeline(client, extraction, book_context, profiler=None):
+    """
+    EXPERIMENTAL: Slim Pass 1 (Haiku) + Rich Pass 2 (Haiku).
+    Same prompts and aggregation as fast mode — only the Pass 2 model changes.
+    Uses larger max_tokens for Pass 2 to give Haiku headroom on the long
+    structured response (Haiku is more likely to hit token caps than Sonnet).
+    """
+    # Detection first so Pass 1 can branch its prompt on book type.
+    if profiler: profiler.start_stage("detection")
+    book_type = client.detect_book_type(extraction)
+    if profiler: profiler.end_stage("detection")
+    logger.info(f"  [detection] Book classified as: {book_type}")
+
+    logger.info(f"STEP 2/4 · Pass 1 [FASTER]: Scoring {len(extraction.chunks)} chunks...")
+
+    if profiler: profiler.start_stage("pass1")
+    slim_analyses = []
+    failed = []
+
+    for i, chunk in enumerate(extraction.chunks):
+        logger.info(f"  [{i+1}/{len(extraction.chunks)}] {chunk.label} ({chunk.word_count:,} words)")
+        try:
+            analysis = client.analyze_chunk_slim(
+                chunk, book_context, tag=f"p1_chunk_{i+1}", book_type=book_type)
+            logger.info(
+                f"         → tone:{analysis.tone} read:{analysis.readability} "
+                f"viol:{analysis.violence} pace:{analysis.pace} "
+                f"world:{analysis.worldbuilding} hum:{analysis.humor} "
+                f"rom:{analysis.romance} chars:{len(analysis.character_names)}")
+            slim_analyses.append(analysis)
+        except Exception as e:
+            logger.error(f"  ✗ Chunk {i} failed: {e}")
+            failed.append(i)
+        if i < len(extraction.chunks) - 1:
+            time.sleep(0.3)
+    if profiler: profiler.end_stage("pass1")
+
+    if not slim_analyses:
+        logger.error("All chunks failed.")
+        sys.exit(1)
+    if failed:
+        logger.warning(f"  {len(failed)} chunks failed — proceeding with {len(slim_analyses)}")
+
+    # (Detection already happened before Pass 1 — book_type is in scope.)
+
+    # ── Branch by book type (Session D) ───────────────────────────────────
+    logger.info("STEP 3/4 · Pass 2 [FASTER → HAIKU]: Full analysis...")
+    if profiler: profiler.start_stage("pass2")
+    # Bump max_tokens generously — Haiku output is cheap and we want headroom
+    # for the full structured JSON (themes, characters, arcs, genders, archetypes,
+    # ages, content flags, summary, etc.) without truncation.
+    holistic = client.analyze_holistic_fast(slim_analyses, extraction, p2_max_tokens=8192)
+    if profiler: profiler.end_stage("pass2")
+    logger.info(f"  → Genre: {holistic.genre.value}")
+    logger.info(f"  → Themes: {len(holistic.ranked_themes)}")
+    logger.info(f"  → Characters: {len(holistic.ranked_characters)}")
+
+    logger.info("STEP 4/4 · Aggregating...")
+    if profiler: profiler.start_stage("aggregation")
+    result = aggregate_analysis_fast(slim_analyses, holistic, extraction)
+    if profiler: profiler.end_stage("aggregation")
+
+    # ── Non-fiction Pass 2 (Session C): populate NonFictionInfo ──────────
+    if book_type == "non_fiction":
+        if profiler: profiler.start_stage("p2_nonfic")
+        logger.info(f"  [non-fic] Running non-fiction Pass 2...")
+        result.non_fiction_info = client.analyze_holistic_nonfic(slim_analyses, extraction)
+        if profiler: profiler.end_stage("p2_nonfic")
+        nfi = result.non_fiction_info
+        logger.info(f"  [non-fic] Sub-type: {nfi.sub_type.value}, audience: {nfi.target_audience.value}, structure: {nfi.structure_type.value}")
+        logger.info(f"  [non-fic] Thesis: {nfi.thesis[:80]}...")
+
+        # If this is a first-person memoir/autobiography, ensure the author
+        # (= the first-person narrator) is ranked as the primary character.
+        # Fixes a structural issue where mention-counting alone ranks people
+        # the author talks ABOUT above the author themselves.
+        result = promote_memoir_protagonist(result, extraction)
+
+
+    return result
 
 
 def batch_analyze(
@@ -206,6 +403,7 @@ def batch_analyze(
     p1_model: str = "claude-sonnet-4-20250514",
     p2_model: str = "claude-sonnet-4-20250514",
     fast_mode: bool = False,
+    faster_mode: bool = False,
 ) -> list[str]:
     pdf_files = sorted(
         list(Path(directory).glob("*.pdf")) +
@@ -218,6 +416,7 @@ def batch_analyze(
     logger.info(f"Found {len(pdf_files)} PDFs to analyze")
     out = output_dir or str(Path(directory) / "analysis_output")
     results: list[str] = []
+    profile_paths: list[str] = []
 
     for i, pdf_path in enumerate(pdf_files):
         logger.info(f"\n{'▓'*60}")
@@ -225,12 +424,39 @@ def batch_analyze(
         logger.info(f"{'▓'*60}")
         try:
             analyze_book(str(pdf_path), api_key=api_key, output_dir=out,
-                        p1_model=p1_model, p2_model=p2_model, fast_mode=fast_mode)
+                        p1_model=p1_model, p2_model=p2_model,
+                        fast_mode=fast_mode, faster_mode=faster_mode)
             results.append(pdf_path.name)
+            # Track the per-book profile sidecar so we can aggregate at the end
+            profile_paths.append(os.path.join(out, f"{Path(pdf_path).stem}_profile.json"))
         except Exception as e:
             logger.error(f"Failed: {pdf_path.name}: {e}")
 
     logger.info(f"\nBatch complete: {len(results)}/{len(pdf_files)} succeeded")
+
+    # ── Aggregate profiles across the whole batch ─────────────────────────
+    if profile_paths:
+        batch_profile_path = os.path.join(out, "batch_profile.json")
+        try:
+            agg = aggregate_batch_profiles(profile_paths, batch_profile_path)
+            if agg:
+                t = agg["totals"]
+                avg = agg["averages_per_book"]
+                logger.info(f"\n{'═'*60}")
+                logger.info(f"  BATCH PROFILE SUMMARY ({agg['book_count']} books)")
+                logger.info(f"{'─'*60}")
+                logger.info(f"  Total wall clock:   {t['wall_clock_seconds']}s")
+                logger.info(f"  Total API calls:    {t['api_calls']}")
+                logger.info(f"  Total input tokens: {t['input_tokens']:,}")
+                logger.info(f"  Total output tokens:{t['output_tokens']:,}")
+                logger.info(f"  Avg input/book:     {avg['input_tokens']:,.0f}")
+                logger.info(f"  Avg output/book:    {avg['output_tokens']:,.0f}")
+                logger.info(f"  Avg time/book:      {avg['wall_clock_seconds']}s")
+                logger.info(f"  Saved → {batch_profile_path}")
+                logger.info(f"{'═'*60}")
+        except Exception as e:
+            logger.warning(f"Failed to aggregate batch profiles: {e}")
+
     return results
 
 
@@ -243,12 +469,14 @@ def main():
     parser.add_argument("--output", "-o", help="Output directory")
     parser.add_argument("--fast", action="store_true",
         help="Fast mode: Haiku for Pass 1, Sonnet for Pass 2 (~10x cheaper)")
+    parser.add_argument("--faster", action="store_true",
+        help="EXPERIMENTAL Faster mode: Haiku for both passes (~30x cheaper)")
     parser.add_argument(
         "--p1-model", default=None,
-        help="Pass 1 model (default: Sonnet, or Haiku in --fast mode)")
+        help="Pass 1 model (default: Sonnet, or Haiku in --fast/--faster mode)")
     parser.add_argument(
-        "--p2-model", default="claude-sonnet-4-20250514",
-        help="Pass 2 model (default: Sonnet, always)")
+        "--p2-model", default=None,
+        help="Pass 2 model (default: Sonnet, or Haiku in --faster mode)")
     parser.add_argument(
         "--model", "-m", default=None,
         help="Set both Pass 1 and Pass 2 to the same model (legacy flag)")
@@ -263,26 +491,34 @@ def main():
         logger.error("No API key. Set ANTHROPIC_API_KEY or use --api-key")
         sys.exit(1)
 
+    # Faster takes precedence over fast if both are set
+    if args.faster and args.fast:
+        logger.warning("Both --fast and --faster set; using --faster")
+        args.fast = False
+
     # Resolve models
     if args.model:
         p1_model = args.model
         p2_model = args.model
+    elif args.faster:
+        p1_model = args.p1_model or "claude-haiku-4-5-20251001"
+        p2_model = args.p2_model or "claude-haiku-4-5-20251001"
     elif args.fast:
         p1_model = args.p1_model or "claude-haiku-4-5-20251001"
-        p2_model = args.p2_model
+        p2_model = args.p2_model or "claude-sonnet-4-20250514"
     else:
         p1_model = args.p1_model or "claude-sonnet-4-20250514"
-        p2_model = args.p2_model
+        p2_model = args.p2_model or "claude-sonnet-4-20250514"
 
     if args.batch:
         batch_analyze(args.input, args.api_key, args.output,
-                     p1_model, p2_model, args.fast)
+                     p1_model, p2_model, args.fast, args.faster)
     else:
         if not os.path.isfile(args.input):
             logger.error(f"File not found: {args.input}")
             sys.exit(1)
         analyze_book(args.input, args.api_key, args.output,
-                    p1_model, p2_model, args.fast)
+                    p1_model, p2_model, args.fast, args.faster)
 
 
 if __name__ == "__main__":

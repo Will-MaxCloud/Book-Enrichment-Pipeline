@@ -23,7 +23,18 @@ from schemas import (
     BookMetadata, Theme, HumorProfile, Character,
     SettingInfo, ContentRatings, ComputedStats,
     HumorType, ContentFlag, POVType, ReadingExperience,
-    CharacterArchetype, BookType, Genre, TimePeriod, SettingType,
+    CharacterArchetype, AgeCategory, BookType, Genre, TimePeriod, SettingType,
+    # Non-fiction enums (Session A: schema infrastructure)
+    BookSubType, TargetAudience, StructureType, ToneRegister, ConclusionType,
+    CommitmentLevel, NarrativeShape, SubjectRelationship, HistoricalPerspective,
+    AcademicLevel, PhilosophyFocus, BusinessAudienceRole, HealthEvidenceBasis,
+    RecipeDifficulty, CookbookPurpose, TravelStyle, TrueCrimeCaseType,
+    TrueCrimeResolution, TrueCrimePerspective,
+    # Non-fiction models (used by Session C sanitizer)
+    NonFictionInfo, SelfHelpAddendum, MemoirBiographyAddendum,
+    HistoryNarrativeAddendum, AcademicTextbookAddendum, PopularScienceAddendum,
+    PhilosophyReligionAddendum, BusinessEconomicsAddendum, HealthFitnessAddendum,
+    CookingFoodAddendum, TravelNatureAddendum, TrueCrimeAddendum,
 )
 from extractor import TextChunk, ExtractionResult
 
@@ -85,7 +96,6 @@ THEME PROMINENCE (1-10):
   "characters_present": [
     {{
       "name": "character's ACTUAL name (not generic descriptions)",
-      "role": "string",
       "importance": int_1_to_10,
       "gender": "male|female|non-binary|unknown",
       "archetypes": [{archetype_values}],
@@ -108,11 +118,14 @@ THEME PROMINENCE (1-10):
 RULES:
 - 2-8 themes from MASTER LIST ONLY.
 - Only named characters. Every character MUST have a real arc_summary (not empty, not generic).
-- Content flags are warnings only — not themes.
+- Content flags are warnings only — not themes. ONLY flag content that is
+  ACTUALLY PRESENT in this section (not just hinted at). A passing mention
+  in one sentence is NOT enough — the content must be genuinely shown or
+  discussed at meaningful length.
 
 TEXT:
 ---
-{chunk.text[:14000]}
+{chunk.text[:100000]}
 ---
 
 JSON:"""
@@ -238,23 +251,114 @@ JSON:"""
 
 class AnalysisClient:
     def __init__(self, api_key, model="claude-sonnet-4-20250514",
-                 p2_model=None, max_retries=3, retry_delay=2.0):
+                 p2_model=None, max_retries=3, retry_delay=2.0,
+                 pace_threshold_tokens=10_000, pace_sleep_seconds=8.0,
+                 detection_model="claude-haiku-4-5-20251001"):
+        """
+        Args:
+            pace_threshold_tokens: only pace after calls that used MORE than
+                                   this many input tokens. Smaller calls fly
+                                   through with no extra delay.
+            pace_sleep_seconds: target gap between large calls. The actual
+                                sleep is reduced by however much wall-clock
+                                time has already passed since the last call,
+                                so this is a *minimum gap*, not an *added*
+                                delay.
+            detection_model: model used for the cheap fiction/non-fiction
+                             pre-classification call. Defaults to Haiku
+                             regardless of Pass 1/2 model choice — detection
+                             is a simple binary task that doesn't need Sonnet.
+
+        The pacer protects against the rate-limit burst pattern that occurs
+        when several large chunks fire in quick succession. Small calls
+        don't need pacing because they don't burst hard enough to trip
+        Anthropic's token bucket.
+        """
         self.api_key = api_key
         self.model = model
         self.p2_model = p2_model or model
+        self.detection_model = detection_model
         self.max_retries, self.retry_delay = max_retries, retry_delay
+        self._profiler = None  # optional Profiler instance; see attach_profiler()
 
-    def _call_api(self, prompt, max_tokens=4096, model_override=None):
+        # ── Lightweight pacer (sequential / single-threaded) ──────────────
+        # Tracks the most recent call's input_tokens and timestamp. Used
+        # to enforce a minimum gap between large back-to-back calls.
+        self.pace_threshold_tokens = pace_threshold_tokens
+        self.pace_sleep_seconds = pace_sleep_seconds
+        self._last_call_ts: float = 0.0
+        self._last_call_tokens: int = 0
+
+    def attach_profiler(self, profiler) -> None:
+        """
+        Attach a Profiler to record per-call token usage and latency.
+        Optional — if never attached, _call_api behaves exactly as before.
+        """
+        self._profiler = profiler
+
+    def _pace_for_request(self) -> None:
+        """
+        Sleep briefly if the previous call was large, to avoid bursting
+        the API's rate limiter.
+
+        Rule: if the last call used MORE than pace_threshold_tokens of
+        input, ensure at least pace_sleep_seconds has elapsed before the
+        next call. Otherwise fly through with no extra delay.
+
+        The actual sleep is shortened by however much wall-clock time has
+        already passed (e.g. from the small inter-chunk sleep in
+        run_analysis.py), so we never sleep more than necessary.
+
+        If our heuristic is wrong, the existing 429 retry handler in
+        _call_api still catches it as a safety net.
+        """
+        if self._last_call_tokens <= self.pace_threshold_tokens:
+            return  # Last call was small — no pacing needed
+
+        elapsed = time.time() - self._last_call_ts
+        remaining = self.pace_sleep_seconds - elapsed
+        if remaining <= 0:
+            return  # Enough time has already passed naturally
+
+        logger.info(f"  [pacer] last call was {self._last_call_tokens:,} tok; "
+                    f"sleeping {remaining:.1f}s before next call")
+        time.sleep(remaining)
+
+    def _call_api(self, prompt, max_tokens=4096, model_override=None, tag="untagged"):
         import anthropic
         client = anthropic.Anthropic(api_key=self.api_key)
         use_model = model_override or self.model
+
+        # Pace before each request based on the previous call's size.
+        self._pace_for_request()
+
         for attempt in range(1, self.max_retries + 1):
             try:
+                call_start = time.time()
                 r = client.messages.create(
                     model=use_model, max_tokens=max_tokens, temperature=0.0,
                     messages=[{"role": "user", "content": prompt}])
+
+                # Record this call's size and timestamp for the next pace check.
+                self._last_call_ts = call_start
+                self._last_call_tokens = r.usage.input_tokens
+
+                # Profiler hook — only runs if attached. Defensive: any failure
+                # here is silently swallowed so profiling can never break a run.
+                if self._profiler is not None:
+                    try:
+                        self._profiler.record_call(
+                            tag=tag, model=use_model,
+                            input_tokens=r.usage.input_tokens,
+                            output_tokens=r.usage.output_tokens,
+                            latency_seconds=time.time() - call_start,
+                            timestamp=call_start,
+                        )
+                    except Exception as e:
+                        logger.warning(f"Profiler record failed (ignored): {e}")
                 return "".join(b.text for b in r.content if b.type == "text").strip()
             except anthropic.RateLimitError:
+                # Pacer didn't catch it — fall back to the API's suggested wait.
                 w = self.retry_delay * (2 ** (attempt - 1))
                 logger.warning(f"Rate limited — {w:.1f}s (attempt {attempt})")
                 time.sleep(w)
@@ -265,27 +369,153 @@ class AnalysisClient:
         raise RuntimeError(f"Failed after {self.max_retries} retries")
 
     # ── Full mode ─────────────────────────────────────────────────────────
-    def analyze_chunk(self, chunk, book_context):
+    def analyze_chunk(self, chunk, book_context, tag="p1_chunk"):
         return ChunkAnalysis(**_sanitize_chunk_data(
-            _safe_parse_json(self._call_api(_build_chunk_prompt(chunk, book_context)))))
+            _safe_parse_json(self._call_api(
+                _build_chunk_prompt(chunk, book_context), tag=tag))))
 
     def analyze_holistic(self, chunk_analyses, extraction):
         return HolisticAnalysis(**_sanitize_holistic_data(
             _safe_parse_json(self._call_api(
                 _build_holistic_prompt(chunk_analyses, extraction), 4096,
-                model_override=self.p2_model))))
+                model_override=self.p2_model, tag="p2_holistic"))))
 
     # ── Fast mode ─────────────────────────────────────────────────────────
-    def analyze_chunk_slim(self, chunk, book_context):
+    def analyze_chunk_slim(self, chunk, book_context, tag="p1_chunk", book_type="fiction"):
         return SlimChunkAnalysis(**_sanitize_slim_chunk_data(
             _safe_parse_json(self._call_api(
-                _build_slim_chunk_prompt(chunk, book_context), 1024))))
+                _build_slim_chunk_prompt(chunk, book_context, book_type), 1024, tag=tag))))
 
-    def analyze_holistic_fast(self, slim_analyses, extraction):
+    def analyze_holistic_fast(self, slim_analyses, extraction, p2_max_tokens=4096):
         return HolisticAnalysis(**_sanitize_holistic_data(
             _safe_parse_json(self._call_api(
-                _build_fast_holistic_prompt(slim_analyses, extraction), 4096,
-                model_override=self.p2_model))))
+                _build_fast_holistic_prompt(slim_analyses, extraction), p2_max_tokens,
+                model_override=self.p2_model, tag="p2_holistic"))))
+
+    # ── Detection (Session B) ─────────────────────────────────────────────
+    def detect_book_type(self, extraction) -> str:
+        """
+        Classify the book as 'fiction' or 'non_fiction'.
+
+        Uses a small Haiku call with the opening sample only. Opening alone
+        is sufficient for >99% reliability — fiction immediately shows narrative
+        voice/dialogue/scene-setting; non-fiction shows expository prose,
+        introductory framing, and often headings or citations.
+
+        Returns:
+            'fiction' or 'non_fiction'. On any error or ambiguous result,
+            defaults to 'fiction' (the safer/legacy path).
+
+        Cost: ~$0.001 per call (~800 words opening sample).
+        """
+        # Use ~800 words of opening for the decision. The model returns one word.
+        opening = (extraction.opening_text or "")[:5000]  # ~800 words = ~5000 chars
+        if not opening.strip():
+            logger.warning("  [detection] No opening text available — defaulting to 'fiction'")
+            return "fiction"
+
+        prompt = _build_detection_prompt(opening)
+        try:
+            response = self._call_api(prompt, max_tokens=10,
+                                       model_override=self.detection_model,
+                                       tag="detection")
+            normalized = response.lower().strip().strip('"').strip("'")
+            # The model might say "non-fiction" or "non fiction" — normalize
+            normalized = normalized.replace("-", "_").replace(" ", "_")
+            if "non_fiction" in normalized or "nonfiction" in normalized:
+                return "non_fiction"
+            elif "fiction" in normalized:
+                return "fiction"
+            else:
+                logger.warning(f"  [detection] Ambiguous response {response!r} — defaulting to 'fiction'")
+                return "fiction"
+        except Exception as e:
+            logger.warning(f"  [detection] Detection call failed ({e}) — defaulting to 'fiction'")
+            return "fiction"
+
+    # ── Non-fiction Pass 2 (Session C) ────────────────────────────────────
+    def analyze_holistic_nonfic(self, pass1_analyses, extraction) -> NonFictionInfo:
+        """
+        Run the non-fiction Pass 2 prompt and return a populated NonFictionInfo
+        with the 7 common-core fields filled in (no addendums yet — Session E).
+
+        Uses self.detection_model (Haiku) because:
+          - The task is mostly classification (enum picks) plus one short
+            descriptive field (thesis). Haiku handles this well.
+          - Cost is ~$0.005 vs ~$0.018 if we used Sonnet.
+          - Output is small (~500 tokens), so Haiku's lower output speed
+            doesn't matter much.
+
+        On failure, returns a fallback NonFictionInfo built via
+        make_stub_nonfic_info() so the caller never has to handle exceptions.
+        The thesis will clearly indicate the analysis failed.
+        """
+        try:
+            prompt = _build_nonfic_holistic_prompt(pass1_analyses, extraction)
+            response = self._call_api(prompt, max_tokens=1024,
+                                       model_override=self.detection_model,
+                                       tag="p2_nonfic")
+            parsed = _safe_parse_json(response)
+            sanitized = _sanitize_nonfic_data(parsed)
+            return NonFictionInfo(**sanitized)
+        except Exception as e:
+            logger.warning(f"  [non-fic] Pass 2 failed ({e}) — using fallback stub")
+            # Build a fallback that signals failure in the output
+            fallback = make_stub_nonfic_info()
+            fallback.thesis = f"[Pass 2 failed: {type(e).__name__}]"
+            return fallback
+
+    # ── Unified non-fiction Pass 2 (Session D) ────────────────────────────
+    def analyze_holistic_nonfic_full(self, pass1_analyses, extraction,
+                                      p2_max_tokens=4096):
+        """
+        Unified non-fiction Pass 2: ONE API call that returns both the universal
+        book fields (genre, themes, categories, setting, summary, etc.) AND the
+        NonFictionInfo block (thesis, target_audience, sub_type, etc.).
+
+        Replaces the need to run the fiction Pass 2 on non-fiction books.
+
+        Returns:
+            tuple of (HolisticAnalysis, NonFictionInfo)
+
+        Model choice: uses self.p2_model (matches user's quality vs fast vs
+        faster mode). Sonnet handles thematic synthesis and summary writing
+        better than Haiku, and we're doing significantly more work in this
+        one call than in Session C's NonFictionInfo-only version.
+
+        Cost (Sonnet): ~10K input + ~2K output ≈ $0.030 per book.
+        Same order of magnitude as the fiction Pass 2 it replaces.
+
+        On failure, returns fallback objects so the caller never has to handle
+        exceptions. The fallback HolisticAnalysis has minimal-default fields;
+        the fallback NonFictionInfo has its thesis set to indicate the failure.
+        """
+        try:
+            prompt = _build_nonfic_holistic_prompt(pass1_analyses, extraction)
+            response = self._call_api(prompt, max_tokens=p2_max_tokens,
+                                       model_override=self.p2_model,
+                                       tag="p2_nonfic")
+            parsed = _safe_parse_json(response)
+
+            # Build NonFictionInfo from the NonFictionInfo-shaped fields
+            nfi_data = _sanitize_nonfic_data(parsed)
+            nfi = NonFictionInfo(**nfi_data)
+
+            # Build HolisticAnalysis from the universal-shaped fields
+            universal_data = _sanitize_nonfic_universal_data(parsed, extraction)
+            holistic = HolisticAnalysis(**universal_data)
+
+            return holistic, nfi
+        except Exception as e:
+            logger.warning(f"  [non-fic] Pass 2 (full) failed ({e}) — using fallbacks")
+            # NonFictionInfo fallback: clearly mark the failure
+            nfi_fallback = make_stub_nonfic_info()
+            nfi_fallback.thesis = f"[Pass 2 failed: {type(e).__name__}]"
+            # HolisticAnalysis fallback: minimal defaults via universal sanitizer
+            # (empty dict gives all-default output that still constructs validly)
+            universal_fallback = _sanitize_nonfic_universal_data({}, extraction)
+            holistic_fallback = HolisticAnalysis(**universal_fallback)
+            return holistic_fallback, nfi_fallback
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -301,6 +531,30 @@ _VALID_GENRES = {g.value for g in Genre}
 _VALID_BTYPES = {b.value for b in BookType}
 _VALID_TIME = {t.value for t in TimePeriod}
 _VALID_SETTING = {s.value for s in SettingType}
+_VALID_AGE = {a.value for a in AgeCategory}
+
+# ── Non-fiction valid-sets (Session A infrastructure) ──────────────────────────
+# Common core
+_VALID_SUBTYPE = {s.value for s in BookSubType}
+_VALID_AUDIENCE = {a.value for a in TargetAudience}
+_VALID_STRUCTURE = {s.value for s in StructureType}
+_VALID_TONE_REG = {t.value for t in ToneRegister}
+_VALID_CONCLUSION = {c.value for c in ConclusionType}
+# Addendum-specific
+_VALID_COMMITMENT = {c.value for c in CommitmentLevel}
+_VALID_NARRATIVE = {n.value for n in NarrativeShape}
+_VALID_SUBJECT_REL = {s.value for s in SubjectRelationship}
+_VALID_HIST_PERSP = {h.value for h in HistoricalPerspective}
+_VALID_ACAD_LEVEL = {a.value for a in AcademicLevel}
+_VALID_PHIL_FOCUS = {p.value for p in PhilosophyFocus}
+_VALID_BIZ_ROLE = {b.value for b in BusinessAudienceRole}
+_VALID_HEALTH_BASIS = {h.value for h in HealthEvidenceBasis}
+_VALID_RECIPE_DIFF = {r.value for r in RecipeDifficulty}
+_VALID_COOKBOOK_PURPOSE = {c.value for c in CookbookPurpose}
+_VALID_TRAVEL_STYLE = {t.value for t in TravelStyle}
+_VALID_TC_CASE = {t.value for t in TrueCrimeCaseType}
+_VALID_TC_RESOLUTION = {t.value for t in TrueCrimeResolution}
+_VALID_TC_PERSPECTIVE = {t.value for t in TrueCrimePerspective}
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -372,12 +626,15 @@ _FLAG_MAP = {
     "sex": "sexual_content", "sex_scenes": "sexual_content",
     "nudity": "sexual_content", "explicit_content": "sexual_content",
     "erotica": "sexual_content", "sexual_themes": "sexual_content",
-    "intimacy": "sexual_content", "explicit_sex": "sexual_content",
-    "drugs": "substance_abuse", "alcohol": "substance_abuse",
-    "drinking": "substance_abuse", "drug_use": "substance_abuse",
+    "explicit_sex": "sexual_content",
+    # NOTE: Removed "intimacy" mapping — emotional intimacy is not
+    # the same as sexual content.
+    "drugs": "substance_abuse", "drug_use": "substance_abuse",
     "alcoholism": "substance_abuse", "overdose": "substance_abuse",
-    "smoking": "substance_abuse", "addiction": "substance_abuse",
-    "withdrawal": "substance_abuse",
+    "addiction": "substance_abuse", "withdrawal": "substance_abuse",
+    # NOTE: Removed mappings that over-flag — alcohol/drinking/smoking
+    # mentioned in passing don't equal substance abuse; let the model
+    # decide if the actual flag applies.
     "suicide": "self_harm", "suicidal": "self_harm",
     "suicidal_ideation": "self_harm", "self_injury": "self_harm",
     "cutting": "self_harm", "self_mutilation": "self_harm",
@@ -392,10 +649,11 @@ _FLAG_MAP = {
     "domestic_violence": "abuse", "domestic_abuse": "abuse",
     "emotional_abuse": "abuse", "physical_abuse": "abuse",
     "psychological_abuse": "abuse", "bullying": "abuse",
-    "neglect": "abuse", "manipulation": "abuse",
-    "gaslighting": "abuse", "cruelty": "abuse",
+    "neglect": "abuse", "gaslighting": "abuse", "cruelty": "abuse",
     "stalking": "abuse", "harassment": "abuse",
     "verbal_abuse": "abuse", "toxic_relationship": "abuse",
+    # NOTE: Removed "manipulation" — too broad; manipulation as a plot
+    # device (heists, politics) shouldn't auto-flag as abuse.
     "racism": "discrimination", "sexism": "discrimination",
     "homophobia": "discrimination", "transphobia": "discrimination",
     "xenophobia": "discrimination", "antisemitism": "discrimination",
@@ -610,6 +868,331 @@ _EXP_MAP = {
     "dreamy": "whimsical",
 }
 
+_AGE_MAP = {
+    # CHILD: 0-12
+    "kid": "child", "kids": "child", "children": "child",
+    "toddler": "child", "baby": "child", "infant": "child",
+    "minor": "child", "preteen": "child", "pre_teen": "child",
+    "tween": "child", "elementary": "child", "preschooler": "child",
+    # TEEN: 13-17
+    "teenager": "teen", "adolescent": "teen", "youth": "teen",
+    "high_schooler": "teen", "highschool": "teen",
+    "teens": "teen", "teenage": "teen", "13": "teen", "14": "teen",
+    "15": "teen", "16": "teen", "17": "teen",
+    # YOUNG ADULT: 18-29
+    "ya": "young_adult", "twenty_something": "young_adult",
+    "twenties": "young_adult", "young": "young_adult",
+    "early_adult": "young_adult", "college": "young_adult",
+    "college_aged": "young_adult", "university": "young_adult",
+    "20s": "young_adult", "early_20s": "young_adult",
+    "late_20s": "young_adult", "20_something": "young_adult",
+    # ADULT: 30-59
+    "middle_aged": "adult", "middle_age": "adult", "mature": "adult",
+    "grown_up": "adult", "grownup": "adult", "midlife": "adult",
+    "30s": "adult", "40s": "adult", "50s": "adult",
+    "early_30s": "adult", "late_30s": "adult",
+    "early_40s": "adult", "late_40s": "adult",
+    "early_50s": "adult", "late_50s": "adult",
+    "thirty_something": "adult", "forty_something": "adult",
+    # ELDERLY: 60+
+    "elder": "elderly", "old": "elderly", "senior": "elderly",
+    "aged": "elderly", "aging": "elderly", "geriatric": "elderly",
+    "old_man": "elderly", "old_woman": "elderly", "grandparent": "elderly",
+    "grandmother": "elderly", "grandfather": "elderly",
+    "60s": "elderly", "70s": "elderly", "80s": "elderly", "90s": "elderly",
+    "elderly_person": "elderly",
+    # AGELESS: gods, immortals, AIs, supernatural
+    "immortal": "ageless", "eternal": "ageless", "timeless": "ageless",
+    "ancient": "ageless", "undying": "ageless", "deathless": "ageless",
+    "god": "ageless", "goddess": "ageless", "deity": "ageless",
+    "spirit": "ageless", "ghost": "ageless", "vampire": "ageless",
+    "ai": "ageless", "artificial_intelligence": "ageless",
+    "robot": "ageless", "android": "ageless", "construct": "ageless",
+    "supernatural": "ageless", "unknown_age": "ageless",
+}
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# NON-FICTION SYNONYM MAPS (Session A infrastructure)
+# ─────────────────────────────────────────────────────────────────────────────
+# These maps catch common variations the model might produce instead of the
+# canonical enum values. The Pass 2 prompt for non-fiction will give the model
+# an explicit enum list, so the model usually returns canonical values directly;
+# these maps are insurance against off-script variations.
+#
+# Substring-match safety: keys are deliberately specific enough that
+# _sanitize_single's substring fallback (when v ⊆ mk or mk ⊆ v with len≥4) won't
+# produce false positives. Avoid 3-letter keys that could be embedded in unrelated
+# strings. We also avoid synonyms that overlap across different enums.
+
+# ── High-variation enums (more thorough coverage) ──────────────────────────────
+
+_SUBTYPE_MAP = {
+    # self_help
+    "self_help_book": "self_help", "instructional": "self_help",
+    "how_to": "self_help", "howto": "self_help", "guide": "self_help",
+    "advice": "self_help", "productivity": "self_help",
+    # memoir_biography
+    "memoir": "memoir_biography", "biography": "memoir_biography",
+    "autobiography": "memoir_biography", "bio": "memoir_biography",
+    "life_story": "memoir_biography",
+    # history_narrative
+    "history": "history_narrative", "narrative_nonfiction": "history_narrative",
+    "narrative_non_fiction": "history_narrative",
+    "historical_nonfiction": "history_narrative",
+    "journalism": "history_narrative", "longform": "history_narrative",
+    # academic_textbook
+    "textbook": "academic_textbook", "academic": "academic_textbook",
+    "scholarly": "academic_textbook", "reference_book": "academic_textbook",
+    "monograph": "academic_textbook",
+    # popular_science
+    "popsci": "popular_science", "pop_science": "popular_science",
+    "science": "popular_science", "science_writing": "popular_science",
+    "nature_writing": "popular_science",
+    # philosophy_religion
+    "philosophy": "philosophy_religion", "religion": "philosophy_religion",
+    "spirituality": "philosophy_religion", "theology": "philosophy_religion",
+    "religious": "philosophy_religion",
+    # business_economics
+    "business": "business_economics", "economics": "business_economics",
+    "finance": "business_economics", "leadership": "business_economics",
+    "management": "business_economics", "entrepreneurship": "business_economics",
+    # health_fitness
+    "health": "health_fitness", "fitness": "health_fitness",
+    "wellness": "health_fitness", "nutrition": "health_fitness",
+    "diet_book": "health_fitness", "medical": "health_fitness",
+    # cooking_food
+    "cookbook": "cooking_food", "cooking": "cooking_food",
+    "recipes": "cooking_food", "food_writing": "cooking_food",
+    "culinary": "cooking_food",
+    # travel_nature
+    "travel": "travel_nature", "travelogue": "travel_nature",
+    "nature": "travel_nature", "outdoor": "travel_nature",
+    "wilderness": "travel_nature",
+    # true_crime
+    "crime": "true_crime", "true_crime_book": "true_crime",
+    "criminal_investigation": "true_crime",
+}
+
+_AUDIENCE_MAP = {
+    # beginner
+    "novice": "beginner", "newbie": "beginner", "entry_level": "beginner",
+    "starter": "beginner", "introductory": "beginner",
+    # intermediate
+    "mid_level": "intermediate", "moderate": "intermediate",
+    "some_experience": "intermediate",
+    # advanced
+    "expert": "advanced", "experienced": "advanced",
+    "professional_level": "advanced", "high_level": "advanced",
+    # general_reader
+    "general": "general_reader", "lay_reader": "general_reader",
+    "general_audience": "general_reader", "lay_person": "general_reader",
+    "popular_audience": "general_reader", "everyone": "general_reader",
+    # specialist
+    "specialist_audience": "specialist", "expert_only": "specialist",
+    "academic_audience": "specialist", "domain_expert": "specialist",
+}
+
+_STRUCTURE_MAP = {
+    # linear_argument
+    "linear": "linear_argument", "sequential": "linear_argument",
+    "cumulative": "linear_argument", "building_argument": "linear_argument",
+    # episodic_chapters
+    "episodic": "episodic_chapters", "standalone_chapters": "episodic_chapters",
+    "self_contained_chapters": "episodic_chapters",
+    "essay_collection": "episodic_chapters",
+    # case_studies
+    "case_study": "case_studies", "examples_based": "case_studies",
+    "vignettes": "case_studies",
+    # reference
+    "reference_work": "reference", "encyclopedic": "reference",
+    "lookup": "reference", "dictionary_style": "reference",
+    # workbook
+    "exercise_book": "workbook", "practice_book": "workbook",
+    "workbook_style": "workbook",
+    # mixed
+    "hybrid": "mixed", "varied": "mixed", "multiple_formats": "mixed",
+}
+
+_TONE_REG_MAP = {
+    # academic
+    "scholarly": "academic", "formal": "academic", "rigorous": "academic",
+    "scientific": "academic",
+    # conversational
+    "casual": "conversational", "informal": "conversational",
+    "approachable": "conversational", "friendly": "conversational",
+    # inspirational
+    "uplifting_tone": "inspirational", "motivational": "inspirational",
+    "encouraging": "inspirational",
+    # sobering
+    "serious": "sobering", "grave": "sobering", "weighty": "sobering",
+    "solemn": "sobering",
+    # witty
+    "humorous": "witty", "amusing": "witty", "clever": "witty",
+    "tongue_in_cheek": "witty",
+    # dense
+    "complex_prose": "dense", "challenging_prose": "dense", "thick": "dense",
+    # breezy
+    "light": "breezy", "easy_reading": "breezy", "quick_read_tone": "breezy",
+    "fluffy": "breezy",
+}
+
+_CONCLUSION_MAP = {
+    # optimistic
+    "positive": "optimistic", "upbeat": "optimistic",
+    "encouraging_ending": "optimistic",
+    # cautionary
+    "warning": "cautionary", "warning_tale": "cautionary",
+    "cautionary_tale": "cautionary",
+    # open_ended
+    "unresolved": "open_ended", "ambiguous": "open_ended",
+    "inconclusive": "open_ended", "open": "open_ended",
+    # definitive
+    "conclusive": "definitive", "settled": "definitive",
+    "resolved": "definitive", "final": "definitive",
+    # provocative
+    "challenging": "provocative", "controversial": "provocative",
+    "thought_provoking_ending": "provocative",
+    # hopeful
+    "encouraging": "hopeful", "promising": "hopeful",
+}
+
+_NARRATIVE_SHAPE_MAP = {
+    # triumph
+    "success_story": "triumph", "overcoming": "triumph",
+    "redemption": "triumph", "triumphant": "triumph",
+    "rise_to_success": "triumph",
+    # cautionary
+    "tragedy": "cautionary", "tragic": "cautionary",
+    "downfall": "cautionary", "warning_story": "cautionary",
+    # witness
+    "observer": "witness", "bystander": "witness", "documentary": "witness",
+    "first_person_account": "witness",
+    # survival
+    "survival_story": "survival", "endurance": "survival",
+    "trauma_recovery": "survival",
+    # coming_of_age
+    "bildungsroman": "coming_of_age", "growing_up": "coming_of_age",
+    "youth_to_adulthood": "coming_of_age",
+}
+
+# ── Low-variation enums (minimal coverage — model usually returns canonical) ───
+
+_COMMITMENT_MAP = {
+    "quick": "quick_read", "easy": "quick_read", "brief": "quick_read",
+    "moderate_effort": "casual_application", "some_practice": "casual_application",
+    "intensive": "serious_practice", "deep_practice": "serious_practice",
+    "rigorous_practice": "serious_practice",
+}
+
+_SUBJECT_REL_MAP = {
+    "self_written": "autobiographical", "first_person": "autobiographical",
+    "authorized_biography": "authorized",
+    "unauthorized_biography": "unauthorized",
+    "academic_biography": "scholarly", "scholarly_biography": "scholarly",
+}
+
+_HIST_PERSP_MAP = {
+    "leaders": "great_figures", "notable_figures": "great_figures",
+    "famous_people": "great_figures", "kings_and_leaders": "great_figures",
+    "ordinary_people": "everyday_people", "common_people": "everyday_people",
+    "common_folk": "everyday_people",
+    "community": "specific_community", "group_focused": "specific_community",
+    "worldwide": "global", "international": "global", "world_history": "global",
+}
+
+_ACAD_LEVEL_MAP = {
+    "college": "undergraduate", "bachelor": "undergraduate",
+    "undergrad": "undergraduate",
+    "masters": "graduate", "doctoral": "graduate", "phd": "graduate",
+    "post_graduate": "graduate", "postgraduate": "graduate",
+    "practitioner": "professional", "working_professional": "professional",
+    "introduction": "intro_survey", "intro": "intro_survey",
+    "survey_course": "intro_survey",
+}
+
+_PHIL_FOCUS_MAP = {
+    "abstract": "theoretical", "conceptual": "theoretical",
+    "applied": "practical", "everyday": "practical", "lived": "practical",
+    "religious_practice": "devotional", "prayer_focused": "devotional",
+    "meditative": "devotional",
+    "history_of_philosophy": "historical", "history_of_religion": "historical",
+}
+
+_BIZ_ROLE_MAP = {
+    "entrepreneur": "founder", "ceo": "founder", "startup_founder": "founder",
+    "executive": "manager", "team_lead": "manager", "supervisor": "manager",
+    "employee": "individual_contributor", "worker": "individual_contributor",
+    "ic": "individual_contributor",
+    "anyone": "general", "general_audience": "general",
+}
+
+_HEALTH_BASIS_MAP = {
+    "research_based": "clinical_research", "evidence_based": "clinical_research",
+    "scientific_research": "clinical_research", "peer_reviewed": "clinical_research",
+    "expert_experience": "practitioner_experience",
+    "doctor_experience": "practitioner_experience",
+    "clinical_practice": "practitioner_experience",
+    "personal_stories": "anecdotal", "testimonials": "anecdotal",
+    "case_reports": "anecdotal",
+    "combined": "mixed", "multiple_sources": "mixed",
+}
+
+_RECIPE_DIFF_MAP = {
+    "easy": "beginner", "simple": "beginner", "basic": "beginner",
+    "medium": "intermediate", "moderate": "intermediate",
+    "expert": "advanced", "professional": "advanced", "complex": "advanced",
+    "varied_difficulty": "mixed", "all_levels": "mixed",
+}
+
+_COOKBOOK_PURPOSE_MAP = {
+    "recipes_only": "recipe_collection", "recipe_book": "recipe_collection",
+    "techniques": "technique", "skills": "technique", "methods": "technique",
+    "food_memoir": "food_narrative", "food_essays": "food_narrative",
+    "food_stories": "food_narrative",
+    "diet_plan": "dietary_program", "meal_plan": "dietary_program",
+    "diet": "dietary_program", "eating_plan": "dietary_program",
+}
+
+_TRAVEL_STYLE_MAP = {
+    "backpacking": "adventure", "extreme_travel": "adventure",
+    "expedition": "adventure",
+    "cultural_immersion": "cultural", "heritage": "cultural",
+    "historical_travel": "cultural",
+    "nature_focused": "nature", "outdoor_travel": "nature",
+    "wildlife": "nature",
+    "high_end": "luxury", "upscale": "luxury", "premium_travel": "luxury",
+    "cheap_travel": "budget", "shoestring": "budget", "low_cost": "budget",
+    "varied_styles": "mixed", "multiple_styles": "mixed",
+}
+
+_TC_CASE_MAP = {
+    "one_case": "single_case", "single_crime": "single_case",
+    "single_event": "single_case",
+    "multiple_crimes": "multiple_cases", "several_cases": "multiple_cases",
+    "anthology": "multiple_cases",
+    "analysis_of_patterns": "pattern_analysis", "systematic": "pattern_analysis",
+    "serial_analysis": "pattern_analysis",
+}
+
+_TC_RESOLUTION_MAP = {
+    "case_solved": "solved", "perpetrator_caught": "solved",
+    "case_unsolved": "unsolved", "mystery": "unsolved",
+    "cold": "cold_case", "old_case": "cold_case",
+    "in_progress": "ongoing", "active_case": "ongoing",
+    "active_investigation": "ongoing",
+}
+
+_TC_PERSPECTIVE_MAP = {
+    "reporter": "journalist", "investigative_journalist": "journalist",
+    "police": "law_enforcement", "detective": "law_enforcement",
+    "fbi": "law_enforcement", "cop": "law_enforcement",
+    "victim_family": "family", "loved_ones": "family", "relatives": "family",
+    "scholar": "academic", "researcher": "academic", "professor": "academic",
+    "criminal": "perpetrator", "killer_perspective": "perpetrator",
+    "from_inside": "perpetrator",
+}
+
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # SANITIZATION
@@ -646,6 +1229,55 @@ def _sanitize_single(value, valid_set, fmap=None, fallback="other"):
         for mk, mv in fmap.items():
             if len(v) >= 4 and (v in mk or mk in v): return mv
     return fallback
+
+
+def _sanitize_age(value):
+    """
+    Normalize an age_category value to a canonical AgeCategory string or None.
+
+    Matching is intentionally STRICT — we'd rather return None ("unknown")
+    than guess wrong. The model is given an explicit enum list in the prompt,
+    so it almost always returns canonical-looking values. The synonym map
+    catches the common variations. Anything else returns None.
+
+    Returns None for:
+      - non-string input
+      - empty / whitespace-only strings
+      - literal "null", "none", "unknown", "n_a", "na", "?"
+      - any value that can't be matched canonically or via _AGE_MAP
+
+    Otherwise returns the canonical lower-case enum value.
+
+    Matching tiers (in order):
+      1. Canonical exact match (after lowercase + whitespace/dash normalization)
+      2. Synonym map exact match
+      3. Collapsed-underscore equivalence ("young adult" → "young_adult" by
+         removing all underscores and comparing — safely catches inconsistent
+         formatting without the false-positive risk of substring matching)
+
+    Note: A previous version had a substring fallback that produced wrong
+    results (e.g., "teen-aged" → "elderly" because "aged" was inside the
+    elderly synonym map). That tier has been removed in favor of returning
+    None when the value isn't clearly classifiable.
+    """
+    if not isinstance(value, str):
+        return None
+    v = value.lower().strip().replace(" ", "_").replace("-", "_")
+    if not v or v in ("null", "none", "unknown", "n_a", "na", "?", "n/a"):
+        return None
+    # Tier 1: canonical exact match
+    if v in _VALID_AGE:
+        return v
+    # Tier 2: synonym map exact match
+    if v in _AGE_MAP:
+        return _AGE_MAP[v]
+    # Tier 3: collapsed-underscore equivalence (safe — no substring matching)
+    vn = v.replace("_", "")
+    for mk, mv in _AGE_MAP.items():
+        if mk.replace("_", "") == vn:
+            return mv
+    # No safe match — return None rather than guess
+    return None
 
 def _normalize_theme(raw):
     r = raw.lower().strip()
@@ -729,16 +1361,25 @@ def _sanitize_chunk_data(data):
                 char["gender"] = "unknown"
             else:
                 char["gender"] = char["gender"].lower().strip()
+            # Normalize age_category to a canonical value or None
+            char["age_category"] = _sanitize_age(char.get("age_category"))
 
     if "content_flags" in data:
         data["content_flags"] = _sanitize_enum_list(data["content_flags"], _VALID_FLAGS, _FLAG_MAP, "none")
     if "humor_types" in data:
         data["humor_types"] = _sanitize_enum_list(data["humor_types"], _VALID_HUMOR, None, "none")
 
+    # Score fields: clamp valid numbers to 1–10; default to 5 when the model
+    # returned null, omitted the field, or returned a non-numeric value.
     for f in ["humor_density", "tone", "readability_score", "violence_level",
               "pace_score", "romance_level", "worldbuilding_level"]:
-        if f in data and isinstance(data[f], (int, float)):
-            data[f] = max(1, min(10, int(data[f])))
+        val = data.get(f)
+        if isinstance(val, bool):
+            data[f] = 5
+        elif isinstance(val, (int, float)):
+            data[f] = max(1, min(10, int(val)))
+        else:
+            data[f] = 5
 
     if "tone_light_to_dark" in data and "tone" not in data:
         data["tone"] = data["tone_light_to_dark"]
@@ -833,6 +1474,13 @@ def _sanitize_holistic_data(data):
         data["character_archetypes"] = sanitized_archetypes
     if "character_ages" not in data or not isinstance(data.get("character_ages"), dict):
         data["character_ages"] = {}
+    else:
+        # Sanitize each character's age value to a canonical AgeCategory or None
+        sanitized_ages = {}
+        for char_name, age_val in data["character_ages"].items():
+            if isinstance(char_name, str) and char_name.strip():
+                sanitized_ages[char_name.strip()] = _sanitize_age(age_val)
+        data["character_ages"] = sanitized_ages
     if "ranked_themes" in data and isinstance(data["ranked_themes"], list):
         norm = []
         for t in data["ranked_themes"]:
@@ -914,11 +1562,10 @@ def aggregate_analysis(chunk_analyses, holistic, extraction):
     humor = HumorProfile(humor_density=ratings.humor,
                           primary_humor_types=top_h or [HumorType.NONE])
 
-    flags = set()
-    for c in chunk_analyses: flags.update(c.content_flags)
-    flags.update(holistic.content_flags)
-    flags.discard(ContentFlag.NONE)
-    cflags = sorted(flags, key=lambda f: f.value) or [ContentFlag.NONE]
+    # Content flags: frequency-based, dynamically capped at 0-6
+    chunk_flag_lists = [list(c.content_flags) for c in chunk_analyses]
+    cflags = _aggregate_content_flags(
+        chunk_flag_lists, list(holistic.content_flags), len(chunk_analyses))
 
     return BookAnalysis(
         metadata=metadata, themes=themes,
@@ -930,6 +1577,67 @@ def aggregate_analysis(chunk_analyses, holistic, extraction):
         sad_ending=holistic.sad_ending, cliffhanger=holistic.cliffhanger,
         ending_notes=holistic.ending_notes, content_flags=cflags,
         overall_summary=holistic.overall_summary)
+
+
+def _aggregate_content_flags(chunk_flag_lists, holistic_flags, num_chunks):
+    """
+    Frequency-based content flag aggregation with dynamic cap.
+
+    A flag only makes the final list if it appears in enough chunks to be
+    considered a recurring/significant element of the book — not a one-off
+    mention. The threshold scales with book length:
+      - Very short (1-5 chunks):    flag must appear in 2+ chunks
+      - Short-medium (6-15 chunks): flag must appear in 3+ chunks
+      - Medium-long (16-30 chunks): flag must appear in 4+ chunks
+      - Long (31+ chunks):          flag must appear in ~15% of chunks
+
+    Pass 2's flags act as a CONFIRMATION signal — a flag that Pass 2 also
+    identified gets a boost (treated as if it appeared in 1 extra chunk),
+    since Pass 2 has full-book context that Pass 1 chunks lack.
+
+    Returns up to 6 flags ranked by frequency. Returns [NONE] if nothing
+    meets the threshold.
+
+    Args:
+        chunk_flag_lists: list of lists of ContentFlag (one list per chunk)
+        holistic_flags: list of ContentFlag from Pass 2 holistic analysis
+        num_chunks: total number of chunks analyzed (for threshold scaling)
+    """
+    # Determine threshold based on book length
+    if num_chunks <= 5:
+        threshold = 2
+    elif num_chunks <= 15:
+        threshold = 3
+    elif num_chunks <= 30:
+        threshold = 4
+    else:
+        threshold = max(4, round(num_chunks * 0.15))
+
+    # Count chunk-level appearances per flag
+    flag_counts: dict = {}
+    for chunk_flags in chunk_flag_lists:
+        # Use set per chunk so a single chunk listing the same flag multiple
+        # times doesn't double-count (defensive)
+        for flag in set(chunk_flags):
+            if flag == ContentFlag.NONE:
+                continue
+            flag_counts[flag] = flag_counts.get(flag, 0) + 1
+
+    # Pass 2 confirmation boost: if Pass 2 flagged it, give it +1
+    # (treats Pass 2's whole-book view as roughly equivalent to 1 chunk vote)
+    p2_flag_set = set(holistic_flags) - {ContentFlag.NONE}
+    for flag in p2_flag_set:
+        flag_counts[flag] = flag_counts.get(flag, 0) + 1
+
+    # Filter by threshold and rank by frequency
+    qualifying = [(flag, count) for flag, count in flag_counts.items()
+                   if count >= threshold]
+    qualifying.sort(key=lambda x: (-x[1], x[0].value))  # frequency DESC, then alphabetical
+
+    # Dynamic cap: 0-6 flags depending on what qualified
+    final_flags = [flag for flag, _ in qualifying[:6]]
+
+    return final_flags or [ContentFlag.NONE]
 
 
 def _aggregate_themes(chunks, holistic):
@@ -979,7 +1687,7 @@ def _aggregate_characters(chunks, holistic):
         for ch in c.characters_present:
             k = ch.name.lower().strip()
             if k not in raw:
-                raw[k] = {"name": ch.name, "role": ch.role,
+                raw[k] = {"name": ch.name,
                           "imp": [], "arch": [], "age": None,
                           "gender": "unknown", "cnt": 0}
             d = raw[k]
@@ -988,7 +1696,6 @@ def _aggregate_characters(chunks, holistic):
             if ch.age_category: d["age"] = ch.age_category
             if hasattr(ch, "gender") and ch.gender and ch.gender != "unknown":
                 d["gender"] = ch.gender
-            if len(ch.role) > len(d["role"]): d["role"] = ch.role
 
     merged = _merge_chars(raw)
     arcs = holistic.character_arcs
@@ -1035,7 +1742,7 @@ def _aggregate_characters(chunks, holistic):
                 gender = "unknown"
 
             result.append(Character(
-                name=cd["name"], role=cd["role"],
+                name=cd["name"],
                 importance=imp,  # Chunk-based MAX: stable across runs
                 gender=gender, archetypes=top_a,
                 arc_summary=arc, age_category=cd["age"]))
@@ -1063,7 +1770,7 @@ def _aggregate_characters(chunks, holistic):
             gender = "unknown"
 
         result.append(Character(
-            name=cd["name"], role=cd["role"], importance=imp,
+            name=cd["name"], importance=imp,
             gender=gender, archetypes=top_a,
             arc_summary=arc, age_category=cd["age"]))
 
@@ -1088,7 +1795,7 @@ def _merge_chars(raw):
         while p in mi: p = mi[p]
         if p not in result:
             pd = raw.get(p, cd)
-            result[p] = {"name": pd["name"], "all": {p}, "role": pd["role"],
+            result[p] = {"name": pd["name"], "all": {p},
                          "imp": list(pd["imp"]), "arch": list(pd["arch"]),
                          "age": pd["age"], "cnt": pd["cnt"]}
         if k != p:
@@ -1096,27 +1803,75 @@ def _merge_chars(raw):
             r["imp"].extend(cd["imp"]); r["arch"].extend(cd["arch"])
             r["cnt"] += cd["cnt"]
             if cd["age"] and not r["age"]: r["age"] = cd["age"]
-            if len(cd["role"]) > len(r["role"]): r["role"] = cd["role"]
             if len(cd["name"]) > len(r["name"]): r["name"] = cd["name"]
     return result
 
 def _same_char(a, b):
-    a, b = a.lower().strip(), b.lower().strip()
-    if a == b: return True
-    if len(a) < 3 or len(b) < 3: return False
-    sh, lo = (a, b) if len(a) <= len(b) else (b, a)
-    if sh in lo and len(sh) >= 3: return True
-    ml = min(len(a), len(b))
-    sp = 0
-    for i in range(ml):
-        if a[i] == b[i]: sp += 1
-        else: break
-    if sp >= 3: return True
-    ss = 0
-    for i in range(1, ml+1):
-        if a[-i] == b[-i]: ss += 1
-        else: break
-    return ss >= 3
+    """
+    Match two character names safely. Returns True only if names refer to
+    the same character.
+
+    Rules (in order):
+    1. Exact match (case-insensitive) → True
+    2. Both names have multiple words → require same first word
+       This rejects siblings/spouses with shared surnames:
+         "Ron Weasley" ↔ "Ginny Weasley" → False
+         "Mr. Weasley" ↔ "Mrs. Weasley" → False
+    3. At least one name is a single word → allow substring match if:
+       - The shorter name is at least 3 characters
+       - The shorter name is contained in the longer name's first word
+       (prevents surname collisions like "Sley" matching "Ron Weasley")
+
+    Catches these same-character variants:
+      "Viv" ↔ "Viv the orc"            → True (single in first word)
+      "Hermione" ↔ "Hermione Granger"  → True (same first word)
+      "Flea" ↔ "Haflea"                → True (substring in single-word name)
+      "Liz" ↔ "Elizabeth"              → True (nickname inside full name)
+      "Tom" ↔ "Tom Riddle"             → True (single in first word)
+
+    Correctly rejects:
+      "Ron Weasley" ↔ "Ginny Weasley"  → False (different first words)
+      "Sley" ↔ "Ron Weasley"           → False (sley not in "ron")
+      "Otter" ↔ "Harry Potter"         → False (otter not in "harry")
+      "Bob" ↔ "Robert"                 → False (no substring relationship)
+    """
+    a = a.lower().strip()
+    b = b.lower().strip()
+    if not a or not b:
+        return False
+    if a == b:
+        return True
+
+    a_parts = a.split()
+    b_parts = b.split()
+    if not a_parts or not b_parts:
+        return False
+
+    a_is_single = len(a_parts) == 1
+    b_is_single = len(b_parts) == 1
+
+    # Both multi-word: must share first word
+    if not a_is_single and not b_is_single:
+        return a_parts[0] == b_parts[0]
+
+    # Both single-word: substring match (handles Flea/Haflea, Liz/Elizabeth)
+    if a_is_single and b_is_single:
+        sh, lo = (a, b) if len(a) <= len(b) else (b, a)
+        return len(sh) >= 3 and sh in lo
+
+    # One single, one multi: single must be in (or contain) the multi's first word.
+    # This is the key safety rule — surnames are never the first word, so
+    # "Sley" can never match "Ron Weasley" via this path.
+    single = a if a_is_single else b
+    multi_first = a_parts[0] if not a_is_single else b_parts[0]
+    if len(single) < 3:
+        return False
+    if single == multi_first:
+        return True
+    if len(single) <= len(multi_first):
+        return single in multi_first
+    else:
+        return multi_first in single
 
 def _find_arc(cd, arcs):
     names = {cd["name"]}
@@ -1157,7 +1912,7 @@ def _aggregate_characters_for_prompt(chunks):
         for ch in c.characters_present:
             k = ch.name.lower().strip()
             if k not in cd:
-                cd[k] = {"name": ch.name, "role": ch.role, "max_importance": 0, "chunk_count": 0}
+                cd[k] = {"name": ch.name, "max_importance": 0, "chunk_count": 0}
             d = cd[k]
             d["max_importance"] = max(d["max_importance"], ch.importance)
             d["chunk_count"] += 1
@@ -1180,7 +1935,7 @@ def _aggregate_characters_for_prompt(chunks):
         while p in mi: p = mi[p]
         if p not in rd:
             pd = cd.get(p, d)
-            rd[p] = {"name": pd["name"], "role": pd["role"],
+            rd[p] = {"name": pd["name"],
                      "max_importance": pd["max_importance"], "chunk_count": pd["chunk_count"]}
         if k != p:
             r = rd[p]
@@ -1189,17 +1944,170 @@ def _aggregate_characters_for_prompt(chunks):
             if len(d["name"]) > len(r["name"]): r["name"] = d["name"]
     return sorted(rd.values(), key=lambda x: x["max_importance"], reverse=True)
 
+
+def promote_memoir_protagonist(result, extraction):
+    """
+    For first-person memoirs/autobiographies, ensure the AUTHOR is ranked as
+    the primary character.
+
+    Background: in first-person memoirs the narrator says "I" throughout, so
+    their own name appears far less often in the text than the names of people
+    they talk about. Pure mention-frequency aggregation will rank a frequently-
+    mentioned partner/parent/sibling above the narrator. This corrects that.
+
+    Trigger conditions (ALL must hold):
+      - book_type == non_fiction
+      - non_fiction_info.sub_type == memoir_biography
+      - holistic POV includes first_person (i.e. autobiography, not external bio)
+      - extraction.author_guess is known
+
+    Behavior:
+      - If the author is already in result.characters, bump them to importance=10
+        and re-sort.
+      - If the author is NOT in the list, prepend them at importance=10 using
+        info from the existing top character as a fallback for required fields.
+      - All other characters keep their existing importance.
+
+    This is a one-line semantic fix — it does NOT touch the mention-counting
+    aggregator, which works correctly for fiction and external biographies.
+    """
+    # Guard: only for first-person memoirs
+    nfi = getattr(result, "non_fiction_info", None)
+    if nfi is None:
+        return result
+    if str(getattr(nfi, "sub_type", "")) not in ("memoir_biography",
+                                                  "BookSubType.MEMOIR_BIOGRAPHY"):
+        # str() because sub_type is an enum; check both common reprs
+        sub_val = getattr(nfi.sub_type, "value", None) if hasattr(nfi, "sub_type") else None
+        if sub_val != "memoir_biography":
+            return result
+
+    author = (extraction.author_guess or "").strip()
+    if not author or author.lower() in ("unknown", ""):
+        return result
+
+    # Check POV — must include first_person to count as autobiography
+    pov_list = getattr(result, "pov", None) or []
+    pov_values = [getattr(p, "value", str(p)) for p in pov_list]
+    if pov_values and "first_person" not in pov_values:
+        # External biography (third-person about someone else) — don't promote
+        return result
+
+    # Find author in existing character list with a scoring approach so we
+    # don't accidentally match a relative who shares the author's last name
+    # (e.g. "Lynne Spears" should NOT match author "Britney Spears").
+    author_norm = author.lower().strip()
+    author_parts = [p for p in author_norm.split() if len(p) >= 2]
+    author_last = author_parts[-1] if author_parts else ""
+    author_first = author_parts[0] if author_parts else ""
+
+    def match_score(char_name: str) -> int:
+        """Higher score = stronger match. 0 = no match."""
+        cn = char_name.lower().strip()
+        # Exact full match wins
+        if cn == author_norm:
+            return 100
+        # Both first and last name present, even if separated
+        if (author_first and author_last
+                and author_first in cn and author_last in cn):
+            return 90
+        # First name match alone (very specific — first names rarely shared
+        # between author and the relatives they're writing about)
+        if author_first and len(author_first) >= 3:
+            for token in cn.split():
+                if token == author_first:
+                    return 80
+        # Last name match alone — weakest, often shared with family members.
+        # Only count it if no stronger match exists for ANY other character.
+        # We return a low score here and let the caller decide.
+        if author_last and author_last in cn.split():
+            return 20
+        return 0
+
+    chars = list(result.characters or [])
+    scored = [(i, match_score(c.name)) for i, c in enumerate(chars)]
+    scored = [(i, s) for i, s in scored if s > 0]
+
+    if scored:
+        # Best match wins; if multiple share the top score, prefer the one
+        # already most prominent (highest importance) — but only among ties.
+        scored.sort(key=lambda x: (-x[1], -chars[x[0]].importance))
+        best_idx, best_score = scored[0]
+
+        # Last-name-only matches (score 20) are weak. If we have a weak match
+        # AND there's no first-name signal anywhere, we'd rather inject a
+        # fresh entry than promote a relative.
+        if best_score >= 80:
+            found_idx = best_idx
+        else:
+            # Treat as not found — fall through to injection
+            found_idx = -1
+    else:
+        found_idx = -1
+
+    if found_idx >= 0:
+        # Bump existing
+        chars[found_idx].importance = 10
+        # Move to front
+        chars.insert(0, chars.pop(found_idx))
+    else:
+        # Inject — borrow archetype/gender from top character if available,
+        # but use defaults otherwise. The author IS the protagonist.
+        from schemas import Character, CharacterArchetype
+        chars.insert(0, Character(
+            name=author,
+            importance=10,
+            gender="unknown",
+            archetypes=[CharacterArchetype.OTHER],
+            arc_summary=f"Author and first-person narrator of this memoir.",
+            age_category=None,
+        ))
+
+    # Ensure no other character outranks the author now
+    for c in chars[1:]:
+        if c.importance > 9:
+            c.importance = 9
+
+    result.characters = chars[:8]  # Schema caps at 8
+    return result
+
 # ═══════════════════════════════════════════════════════════════════════════════
 # FAST MODE — Slim Pass 1 (Haiku) + Rich Pass 2 (Sonnet)
 # ═══════════════════════════════════════════════════════════════════════════════
 
-def _build_slim_chunk_prompt(chunk, book_context):
-    """Tiny prompt for Haiku — just scores, names, flags, summary."""
+def _build_slim_chunk_prompt(chunk, book_context, book_type="fiction"):
+    """Tiny prompt for Haiku — just scores, names, flags, summary.
+
+    Branches on book_type so non-fiction (memoirs, biographies, history) gets
+    correct guidance: real people ARE the characters in a memoir, and the
+    first-person narrator IS the author/subject.
+    """
     flag_values = ", ".join(f'"{f.value}"' for f in ContentFlag)
+
+    # Different character-extraction guidance per book type.
+    # The fiction wording explicitly excludes real people (editors, authors)
+    # because in novels those would be acknowledgments noise.
+    # The non-fiction wording explicitly INCLUDES real people, and reminds
+    # the model that in first-person memoirs the narrator "I" is the author.
+    if book_type == "non_fiction":
+        char_instruction = (
+            'up to 10 named PEOPLE who appear in this section. Include the '
+            'author/narrator if this is a memoir or first-person account '
+            '(in memoirs the "I" voice IS a primary character). Include real '
+            'people the text discusses by name. Exclude only meta-mentions '
+            'like editors/publishers in acknowledgments-style asides.'
+        )
+    else:
+        char_instruction = (
+            "up to 10 character names — fictional characters who appear or "
+            "are discussed in this section. Exclude real-world meta-mentions "
+            "(editors, publishers, dedicatees)."
+        )
 
     return f"""Score this text section. Respond ONLY with JSON, no preamble.
 
 CONTEXT: {book_context}
+BOOK TYPE: {book_type}
 SECTION: {chunk.label} (~{chunk.word_count} words)
 
 SCORING (1-10):
@@ -1223,14 +2131,24 @@ JSON:
   "worldbuilding": int,
   "humor": int,
   "romance": int,
-  "character_names": ["up to 10 FICTIONAL character names only — not real people, editors, or authors"],
+  "character_names": ["{char_instruction}"],
   "content_flags": [{flag_values}],
   "summary": "One sentence summary of what happens in this section."
 }}
 
+CONTENT FLAG RULES — IMPORTANT:
+- Only include flags for content that is ACTUALLY PRESENT in this section
+  (genuinely shown or discussed at meaningful length — not just hinted at).
+- A passing one-sentence mention is NOT enough to flag.
+- Example: a character pouring a glass of wine is NOT "substance_abuse".
+  A character struggling with addiction throughout the section IS.
+- Example: a brief tense argument is NOT "graphic_violence". An on-page
+  fight, attack, or violent death IS.
+- If nothing applies, return [] or ["none"].
+
 TEXT:
 ---
-{chunk.text[:14000]}
+{chunk.text[:100000]}
 ---
 
 JSON:"""
@@ -1238,11 +2156,18 @@ JSON:"""
 
 def _sanitize_slim_chunk_data(data):
     """Sanitize slim chunk data."""
+    # Score fields: clamp valid numbers to 1–10; default to 5 when the model
+    # returned null, omitted the field, or returned a non-numeric value
+    # (happens on tiny/empty chunks the model can't meaningfully score).
     for f in ["tone", "readability", "violence", "pace",
               "worldbuilding", "humor", "romance"]:
-        if f in data and isinstance(data[f], (int, float)):
-            data[f] = max(1, min(10, int(data[f])))
-        elif f not in data:
+        val = data.get(f)
+        if isinstance(val, bool):
+            # bool is a subclass of int — reject it explicitly
+            data[f] = 5
+        elif isinstance(val, (int, float)):
+            data[f] = max(1, min(10, int(val)))
+        else:
             data[f] = 5
 
     if "character_names" in data and isinstance(data["character_names"], list):
@@ -1261,6 +2186,778 @@ def _sanitize_slim_chunk_data(data):
         data["summary"] = ""
 
     return data
+
+
+def _build_detection_prompt(opening_text: str) -> str:
+    """
+    Tiny prompt that asks the model to classify a book sample as fiction
+    or non-fiction. Used by AnalysisClient.detect_book_type.
+
+    Output: single word — 'fiction' or 'non_fiction'.
+
+    The prompt is deliberately simple. Modern Claude models are very reliable
+    on this binary distinction. We accept either phrasing variant in parsing.
+    """
+    return f"""Read this opening passage from a book. Decide if the book is FICTION or NON-FICTION.
+
+Guidelines:
+- Fiction: novels, novellas, short story collections, narrative invented stories
+- Non-fiction: memoirs, biographies, history, self-help, science writing, philosophy,
+  business, cookbooks, travel writing, true crime, journalism, academic works
+- Memoirs and autobiographies are NON-FICTION (they describe real events)
+- Historical novels and biographical novels are FICTION (they invent dialogue/scenes)
+- If uncertain, lean toward FICTION (the more common case)
+
+Respond with EXACTLY ONE WORD: "fiction" or "non_fiction". No other text.
+
+PASSAGE:
+---
+{opening_text}
+---
+
+ANSWER:"""
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# NON-FICTION PASS 2 — common-core fields (Session C)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def _build_nonfic_holistic_prompt(pass1_analyses, extraction):
+    """
+    Pass 2 prompt for non-fiction books. Returns JSON with BOTH:
+      - The 8 NonFictionInfo fields (thesis, target_audience, prerequisites,
+        structure_type, tone_register, practical_vs_theoretical, conclusion_type,
+        sub_type)
+      - The universal fields needed to construct a BookAnalysis (genre,
+        sub_genres, setting, reading_experience, categories, age_target,
+        content_flags, overall_summary, ranked_themes)
+
+    Skips fiction-only fields entirely (characters, character_arcs, POV,
+    sad_ending, cliffhanger, humor_types).
+
+    This is the unified non-fiction Pass 2 — running this means we no longer
+    need to run the fiction Pass 2 on non-fiction books.
+
+    Works with both ChunkAnalysis (quality mode) and SlimChunkAnalysis (fast/faster
+    mode) — only reads `.label` and `.summary` from each chunk analysis.
+    """
+    # Build a compact chapter spine: label + summary per chunk
+    chunk_spine_lines = []
+    for sa in pass1_analyses:
+        label = getattr(sa, "label", None) or getattr(sa, "chunk_label", "?")
+        summary = getattr(sa, "summary", "") or ""
+        chunk_spine_lines.append(f"- {label}: {summary[:300]}")
+    chunk_spine = "\n".join(chunk_spine_lines[:60])  # cap at 60 chapters for safety
+
+    # Compact metadata header
+    title = getattr(extraction, "title", "") or "(unknown title)"
+    author = getattr(extraction, "author", "") or "(unknown author)"
+    word_count = getattr(extraction, "total_words", 0)
+
+    # ── Valid enum values for the prompt ──
+    # NonFictionInfo enums
+    subtypes = ", ".join(f'"{s.value}"' for s in BookSubType)
+    audiences = ", ".join(f'"{a.value}"' for a in TargetAudience)
+    structures = ", ".join(f'"{s.value}"' for s in StructureType)
+    tones = ", ".join(f'"{t.value}"' for t in ToneRegister)
+    conclusions = ", ".join(f'"{c.value}"' for c in ConclusionType)
+    # Universal enums (subset relevant to non-fiction)
+    # Filter Genre to non-fiction-friendly values, but allow all so the model can pick
+    non_fic_genres = ", ".join(f'"{g.value}"' for g in [
+        Genre.BIOGRAPHIES_AND_MEMOIRS, Genre.BUSINESS_AND_ECONOMICS,
+        Genre.COOKBOOKS_AND_FOOD, Genre.HEALTH_FITNESS_AND_WELLNESS,
+        Genre.HISTORY, Genre.NATURE_AND_ENVIRONMENT,
+        Genre.PHILOSOPHY_AND_RELIGION, Genre.SCIENCE_AND_TECHNOLOGY,
+        Genre.SELF_HELP, Genre.SOCIAL_SCIENCES, Genre.SPORTS_AND_OUTDOORS,
+        Genre.TRAVEL, Genre.TRUE_CRIME, Genre.ESSAYS_AND_ANTHOLOGIES,
+        Genre.ARTS_AND_PHOTOGRAPHY, Genre.CRAFTS_HOBBIES_AND_HOME,
+        Genre.EDUCATION_AND_REFERENCE, Genre.HUMOR, Genre.LAW_AND_POLITICS,
+        Genre.PARENTING_AND_FAMILY, Genre.RELIGIOUS_AND_INSPIRATIONAL,
+        Genre.OTHER,
+    ])
+    reading_exps = ", ".join(f'"{r.value}"' for r in ReadingExperience)
+    content_flag_values = ", ".join(f'"{c.value}"' for c in ContentFlag)
+    time_periods = ", ".join(f'"{t.value}"' for t in TimePeriod)
+    setting_types = ", ".join(f'"{s.value}"' for s in SettingType)
+
+    # ── Addendum-specific enums (Session E) ──
+    commitment_levels = ", ".join(f'"{c.value}"' for c in CommitmentLevel)
+    narrative_shapes = ", ".join(f'"{n.value}"' for n in NarrativeShape)
+    subject_rels = ", ".join(f'"{s.value}"' for s in SubjectRelationship)
+    hist_perspectives = ", ".join(f'"{h.value}"' for h in HistoricalPerspective)
+    acad_levels = ", ".join(f'"{a.value}"' for a in AcademicLevel)
+    phil_foci = ", ".join(f'"{p.value}"' for p in PhilosophyFocus)
+    biz_roles = ", ".join(f'"{b.value}"' for b in BusinessAudienceRole)
+    health_bases = ", ".join(f'"{h.value}"' for h in HealthEvidenceBasis)
+    recipe_diffs = ", ".join(f'"{r.value}"' for r in RecipeDifficulty)
+    cookbook_purposes = ", ".join(f'"{c.value}"' for c in CookbookPurpose)
+    travel_styles = ", ".join(f'"{t.value}"' for t in TravelStyle)
+    tc_case_types = ", ".join(f'"{t.value}"' for t in TrueCrimeCaseType)
+    tc_resolutions = ", ".join(f'"{t.value}"' for t in TrueCrimeResolution)
+    tc_perspectives = ", ".join(f'"{t.value}"' for t in TrueCrimePerspective)
+
+    # Master lists for themes / sub_genres / categories
+    theme_list = "\n".join(f'  - "{t}"' for t in MASTER_THEMES)
+    sub_genre_list = "\n".join(f'  - "{s}"' for s in MASTER_SUB_GENRES)
+    category_list = "\n".join(f'  - "{c}"' for c in MASTER_CATEGORIES)
+
+    opening = (extraction.opening_text or "")[:6000]
+    closing = (extraction.closing_text or "")[:4000]
+
+    return f"""Analyze this non-fiction book. Respond ONLY with JSON, no preamble.
+
+BOOK: "{title}" by {author} ({word_count:,} words)
+
+CHAPTER SPINE (label + 1-sentence summary):
+{chunk_spine}
+
+OPENING SAMPLE:
+---
+{opening}
+---
+
+CLOSING SAMPLE:
+---
+{closing}
+---
+
+Fill in this JSON. Use exact canonical values for enum fields.
+
+{{
+  "thesis": "1-2 sentence statement of the book's central argument, claim, or stated purpose. Different from a summary — this is what the author wants the reader to take away.",
+  "target_audience": "pick one from: {audiences}",
+  "prerequisites": ["list of things readers should know first — empty list if none required"],
+  "structure_type": "pick one from: {structures}",
+  "tone_register": ["pick 1-3 from: {tones}"],
+  "practical_vs_theoretical": <int 1-10, where 1 = pure theory, 10 = pure actionable how-to>,
+  "conclusion_type": "pick one from: {conclusions}",
+  "sub_type": "pick the BEST single sub-type from: {subtypes}",
+
+  "self_help": null,
+  "memoir_biography": null,
+  "history_narrative": null,
+  "academic_textbook": null,
+  "popular_science": null,
+  "philosophy_religion": null,
+  "business_economics": null,
+  "health_fitness": null,
+  "cooking_food": null,
+  "travel_nature": null,
+  "true_crime": null,
+
+  "genre": "pick one from: {non_fic_genres}",
+  "sub_genres": ["1-3 specific sub-genres from the master list below"],
+  "ranked_themes": ["3-7 themes from the master list, most prominent first"],
+  "categories": ["exactly 3 discovery categories from the master list below"],
+  "reading_experience": ["1-4 experience tags from: {reading_exps}"],
+  "content_flags": ["any applicable from: {content_flag_values}. Use [\\"none\\"] if none apply."],
+  "setting": {{
+    "primary_location": "specific location, region, or topic-domain. Empty string if not applicable.",
+    "time_period": "pick one from: {time_periods}",
+    "setting_type": "pick one from: {setting_types}",
+    "real_or_fictional": "always 'real' for non-fiction",
+    "additional_locations": []
+  }},
+  "age_target": <int 1-10, where 10 is most appropriate for very young readers, 1 is most adult>,
+  "overall_summary": "2-3 sentence factual summary of what the book covers."
+}}
+
+GUIDELINES — NON-FICTION-SPECIFIC FIELDS:
+- thesis: be specific. "About productivity" is bad; "Habits are formed by repeating small actions consistently over time" is good.
+- prerequisites: only include if the book explicitly assumes prior knowledge. Most general-audience books need none.
+- structure_type:
+  - linear_argument: sequential chapters building one argument (most common)
+  - episodic_chapters: standalone chapters/essays, any order
+  - case_studies: organized around real examples
+  - reference: meant to be looked up by topic
+  - workbook: contains exercises/prompts
+  - mixed: combines multiple structures
+- tone_register: 1-3 values describing the writing VOICE (not topic).
+- practical_vs_theoretical: tactics book = 9-10; philosophy = 1-3; pop-science = 3-6.
+- conclusion_type: how does the book end?
+- sub_type: pick the SINGLE best fit. Use "other" only if truly no fit (poetry, art book).
+
+GUIDELINES — SUB-TYPE ADDENDUMS:
+Fill in EXACTLY ONE addendum object that matches the chosen sub_type. Leave all
+other addendum fields as null. If sub_type is "other", leave all addendums null.
+
+If sub_type == "self_help":
+  {{
+    "skill_or_outcome": "<short phrase: what the reader will be able to do>",
+    "has_exercises": <true/false>,
+    "commitment_level": "<one of: {commitment_levels}>"
+  }}
+
+If sub_type == "memoir_biography":
+  {{
+    "life_period_covered": "<short phrase: e.g. 'childhood through college'>",
+    "narrative_shape": "<one of: {narrative_shapes}>",
+    "subject_relationship": "<one of: {subject_rels}>"
+  }}
+
+If sub_type == "history_narrative":
+  {{
+    "historical_period": "<the time period the book focuses on>",
+    "geographic_focus": "<region, country, or area covered>",
+    "perspective_centered": "<one of: {hist_perspectives}>"
+  }}
+
+If sub_type == "academic_textbook":
+  {{
+    "discipline": "<field of study, e.g. 'biochemistry'>",
+    "level": "<one of: {acad_levels}>",
+    "has_exercises": <true/false>
+  }}
+
+If sub_type == "popular_science":
+  {{
+    "scientific_domain": "<branch of science, e.g. 'cosmology'>",
+    "accessibility_score": <int 1-10, 1=requires deep prior knowledge, 10=fully accessible>,
+    "is_cutting_edge": <true/false: true if covers recent or developing science>
+  }}
+
+If sub_type == "philosophy_religion":
+  {{
+    "tradition": "<tradition/school, e.g. 'analytic philosophy', 'Zen Buddhism'>",
+    "focus": "<one of: {phil_foci}>"
+  }}
+
+If sub_type == "business_economics":
+  {{
+    "domain": "<specific area, e.g. 'leadership', 'behavioral economics'>",
+    "audience_role": "<one of: {biz_roles}>"
+  }}
+
+If sub_type == "health_fitness":
+  {{
+    "focus_area": "<specific area, e.g. 'nutrition', 'sleep', 'strength training'>",
+    "evidence_basis": "<one of: {health_bases}>"
+  }}
+
+If sub_type == "cooking_food":
+  {{
+    "cuisine_type": "<cuisine/tradition, e.g. 'French', 'plant-based'>",
+    "recipe_difficulty": "<one of: {recipe_diffs}>",
+    "book_purpose": "<one of: {cookbook_purposes}>"
+  }}
+
+If sub_type == "travel_nature":
+  {{
+    "location_focus": "<primary location or region>",
+    "travel_style": "<one of: {travel_styles}>"
+  }}
+
+If sub_type == "true_crime":
+  {{
+    "case_type": "<one of: {tc_case_types}>",
+    "resolution": "<one of: {tc_resolutions}>",
+    "investigation_perspective": "<one of: {tc_perspectives}>"
+  }}
+
+GUIDELINES — UNIVERSAL FIELDS:
+- genre: pick the genre that best describes the BOOK CATEGORY (not the sub_type).
+  A memoir = biographies_and_memoirs. A productivity book = self_help.
+- ranked_themes: 3-7 themes the book engages with. Use the master list exactly.
+  Non-fiction themes can include things like 'memory', 'identity', 'power', 'community',
+  'science_and_discovery', 'work_and_career', 'personal_growth'.
+- setting: For MEMOIRS, BIOGRAPHIES, HISTORY, TRAVEL, TRUE CRIME — give real setting
+  (e.g. memoir of growing up in 1980s Detroit → primary_location="Detroit",
+  time_period="late_20th_century", setting_type="urban"). For SELF-HELP, PHILOSOPHY,
+  BUSINESS, COOKING, HEALTH — use defaults (primary_location="",
+  time_period="timeless_or_unspecified", setting_type="domestic").
+- age_target: 10 = picture books / very young; 7-9 = general adult reader; 5-6 = teen+;
+  1-4 = mature/explicit content only.
+- content_flags: apply to non-fiction too. War histories have violence flags;
+  trauma memoirs have abuse/death; medical books may have explicit_health_content.
+- overall_summary: factual, NOT marketing copy. 2-3 sentences.
+
+MASTER THEMES (use EXACT strings):
+{theme_list}
+
+MASTER SUB_GENRES (use EXACT strings):
+{sub_genre_list}
+
+MASTER CATEGORIES (use EXACT strings, pick 3):
+{category_list}
+
+JSON:"""
+
+
+def _sanitize_self_help_addendum(raw):
+    """
+    Sanitize a self_help addendum dict from the Pass 2 response.
+
+    Returns either:
+      - A dict ready to construct SelfHelpAddendum(**dict), OR
+      - None if raw is null/missing/not a dict (signals "no addendum")
+
+    All fields are Optional, so any individual field that can't be cleaned
+    falls back to None — the addendum object itself is still constructed.
+    """
+    if not isinstance(raw, dict):
+        return None
+
+    out = {}
+
+    # skill_or_outcome: short string
+    sko = raw.get("skill_or_outcome")
+    if isinstance(sko, str) and sko.strip():
+        out["skill_or_outcome"] = sko.strip()[:500]
+    else:
+        out["skill_or_outcome"] = None
+
+    # has_exercises: bool
+    he = raw.get("has_exercises")
+    if isinstance(he, bool):
+        out["has_exercises"] = he
+    elif isinstance(he, str):
+        s = he.strip().lower()
+        if s in ("true", "yes", "1"):
+            out["has_exercises"] = True
+        elif s in ("false", "no", "0"):
+            out["has_exercises"] = False
+        else:
+            out["has_exercises"] = None
+    else:
+        out["has_exercises"] = None
+
+    # commitment_level: enum (single)
+    cl = raw.get("commitment_level")
+    if isinstance(cl, str) and cl.strip():
+        cleaned = _sanitize_single(cl, _VALID_COMMITMENT, _COMMITMENT_MAP, None)
+        out["commitment_level"] = cleaned  # may be None if no match
+    else:
+        out["commitment_level"] = None
+
+    return out
+
+
+# ── Shared micro-helpers for addendum sanitization (Session E) ─────────────
+# These are tiny no-abstraction helpers that just reduce typo risk across
+# the 11 addendum sanitizers below.
+
+def _addendum_str(raw, key, max_len=500):
+    """Extract a string field from an addendum dict; None if missing/empty/wrong type."""
+    v = raw.get(key)
+    if isinstance(v, str) and v.strip():
+        return v.strip()[:max_len]
+    return None
+
+
+def _addendum_bool(raw, key):
+    """Extract a bool field; accept 'true'/'false' strings; None on bad input."""
+    v = raw.get(key)
+    if isinstance(v, bool):
+        return v
+    if isinstance(v, str):
+        s = v.strip().lower()
+        if s in ("true", "yes", "1"):
+            return True
+        if s in ("false", "no", "0"):
+            return False
+    return None
+
+
+def _addendum_enum(raw, key, valid_set, synonym_map):
+    """Extract and sanitize an enum field; None on missing/invalid."""
+    v = raw.get(key)
+    if isinstance(v, str) and v.strip():
+        return _sanitize_single(v, valid_set, synonym_map, None)
+    return None
+
+
+def _addendum_int(raw, key, lo=1, hi=10):
+    """Extract an int field clamped to [lo, hi]; None on bad input."""
+    v = raw.get(key)
+    if isinstance(v, bool):  # bool is subclass of int — exclude
+        return None
+    if isinstance(v, (int, float)):
+        return max(lo, min(hi, int(v)))
+    if isinstance(v, str) and v.strip().lstrip("-").isdigit():
+        return max(lo, min(hi, int(v.strip())))
+    return None
+
+
+def _sanitize_memoir_biography_addendum(raw):
+    """Sanitize memoir/biography addendum. Fields: life_period_covered (str),
+    narrative_shape (enum), subject_relationship (enum)."""
+    if not isinstance(raw, dict):
+        return None
+    return {
+        "life_period_covered": _addendum_str(raw, "life_period_covered"),
+        "narrative_shape": _addendum_enum(raw, "narrative_shape",
+            _VALID_NARRATIVE, _NARRATIVE_SHAPE_MAP),
+        "subject_relationship": _addendum_enum(raw, "subject_relationship",
+            _VALID_SUBJECT_REL, _SUBJECT_REL_MAP),
+    }
+
+
+def _sanitize_history_narrative_addendum(raw):
+    """Sanitize history/narrative addendum. Fields: historical_period (str),
+    geographic_focus (str), perspective_centered (enum)."""
+    if not isinstance(raw, dict):
+        return None
+    return {
+        "historical_period": _addendum_str(raw, "historical_period"),
+        "geographic_focus": _addendum_str(raw, "geographic_focus"),
+        "perspective_centered": _addendum_enum(raw, "perspective_centered",
+            _VALID_HIST_PERSP, _HIST_PERSP_MAP),
+    }
+
+
+def _sanitize_academic_textbook_addendum(raw):
+    """Sanitize academic textbook addendum. Fields: discipline (str),
+    level (enum), has_exercises (bool)."""
+    if not isinstance(raw, dict):
+        return None
+    return {
+        "discipline": _addendum_str(raw, "discipline"),
+        "level": _addendum_enum(raw, "level", _VALID_ACAD_LEVEL, _ACAD_LEVEL_MAP),
+        "has_exercises": _addendum_bool(raw, "has_exercises"),
+    }
+
+
+def _sanitize_popular_science_addendum(raw):
+    """Sanitize popular science addendum. Fields: scientific_domain (str),
+    accessibility_score (int 1-10), is_cutting_edge (bool)."""
+    if not isinstance(raw, dict):
+        return None
+    return {
+        "scientific_domain": _addendum_str(raw, "scientific_domain"),
+        "accessibility_score": _addendum_int(raw, "accessibility_score"),
+        "is_cutting_edge": _addendum_bool(raw, "is_cutting_edge"),
+    }
+
+
+def _sanitize_philosophy_religion_addendum(raw):
+    """Sanitize philosophy/religion addendum. Fields: tradition (str), focus (enum)."""
+    if not isinstance(raw, dict):
+        return None
+    return {
+        "tradition": _addendum_str(raw, "tradition"),
+        "focus": _addendum_enum(raw, "focus", _VALID_PHIL_FOCUS, _PHIL_FOCUS_MAP),
+    }
+
+
+def _sanitize_business_economics_addendum(raw):
+    """Sanitize business/economics addendum. Fields: domain (str), audience_role (enum)."""
+    if not isinstance(raw, dict):
+        return None
+    return {
+        "domain": _addendum_str(raw, "domain"),
+        "audience_role": _addendum_enum(raw, "audience_role",
+            _VALID_BIZ_ROLE, _BIZ_ROLE_MAP),
+    }
+
+
+def _sanitize_health_fitness_addendum(raw):
+    """Sanitize health/fitness addendum. Fields: focus_area (str), evidence_basis (enum)."""
+    if not isinstance(raw, dict):
+        return None
+    return {
+        "focus_area": _addendum_str(raw, "focus_area"),
+        "evidence_basis": _addendum_enum(raw, "evidence_basis",
+            _VALID_HEALTH_BASIS, _HEALTH_BASIS_MAP),
+    }
+
+
+def _sanitize_cooking_food_addendum(raw):
+    """Sanitize cooking/food addendum. Fields: cuisine_type (str),
+    recipe_difficulty (enum), book_purpose (enum)."""
+    if not isinstance(raw, dict):
+        return None
+    return {
+        "cuisine_type": _addendum_str(raw, "cuisine_type"),
+        "recipe_difficulty": _addendum_enum(raw, "recipe_difficulty",
+            _VALID_RECIPE_DIFF, _RECIPE_DIFF_MAP),
+        "book_purpose": _addendum_enum(raw, "book_purpose",
+            _VALID_COOKBOOK_PURPOSE, _COOKBOOK_PURPOSE_MAP),
+    }
+
+
+def _sanitize_travel_nature_addendum(raw):
+    """Sanitize travel/nature addendum. Fields: location_focus (str), travel_style (enum)."""
+    if not isinstance(raw, dict):
+        return None
+    return {
+        "location_focus": _addendum_str(raw, "location_focus"),
+        "travel_style": _addendum_enum(raw, "travel_style",
+            _VALID_TRAVEL_STYLE, _TRAVEL_STYLE_MAP),
+    }
+
+
+def _sanitize_true_crime_addendum(raw):
+    """Sanitize true crime addendum. Fields: case_type (enum), resolution (enum),
+    investigation_perspective (enum)."""
+    if not isinstance(raw, dict):
+        return None
+    return {
+        "case_type": _addendum_enum(raw, "case_type", _VALID_TC_CASE, _TC_CASE_MAP),
+        "resolution": _addendum_enum(raw, "resolution",
+            _VALID_TC_RESOLUTION, _TC_RESOLUTION_MAP),
+        "investigation_perspective": _addendum_enum(raw, "investigation_perspective",
+            _VALID_TC_PERSPECTIVE, _TC_PERSPECTIVE_MAP),
+    }
+
+
+def _sanitize_nonfic_data(data):
+    """
+    Validate and normalize the NonFictionInfo-specific fields of the non-fiction
+    Pass 2 JSON output. Produces safe defaults when the model returns
+    invalid/missing values, so NonFictionInfo construction never fails.
+
+    Returns a dict ready to splat into NonFictionInfo(**data).
+
+    Handles common-core fields plus sub-type addendums (Session E).
+    Each addendum is only populated if sub_type matches; otherwise stays None.
+    """
+    if not isinstance(data, dict):
+        data = {}
+    # Work on a copy so we don't mutate the caller's dict
+    data = dict(data)
+
+    # thesis (required string)
+    thesis = data.get("thesis")
+    if not isinstance(thesis, str) or not thesis.strip():
+        data["thesis"] = "(Unable to determine thesis from text)"
+    else:
+        data["thesis"] = thesis.strip()[:1000]  # cap length
+
+    # target_audience (single enum, fallback to general_reader)
+    data["target_audience"] = _sanitize_single(
+        data.get("target_audience", ""), _VALID_AUDIENCE, _AUDIENCE_MAP, "general_reader")
+
+    # prerequisites (list of strings, empty list if absent/invalid)
+    prereqs = data.get("prerequisites")
+    if isinstance(prereqs, list):
+        data["prerequisites"] = [p.strip() for p in prereqs if isinstance(p, str) and p.strip()][:10]
+    else:
+        data["prerequisites"] = []
+
+    # structure_type (single enum, fallback to mixed)
+    data["structure_type"] = _sanitize_single(
+        data.get("structure_type", ""), _VALID_STRUCTURE, _STRUCTURE_MAP, "mixed")
+
+    # tone_register (list of 1-3 enum values; ensure at least one)
+    tone_list = data.get("tone_register")
+    if isinstance(tone_list, list):
+        sanitized = _sanitize_enum_list(tone_list, _VALID_TONE_REG, _TONE_REG_MAP, "conversational")
+        data["tone_register"] = sanitized[:3]
+    elif isinstance(tone_list, str):
+        single = _sanitize_single(tone_list, _VALID_TONE_REG, _TONE_REG_MAP, "conversational")
+        data["tone_register"] = [single]
+    else:
+        data["tone_register"] = ["conversational"]
+    if not data["tone_register"]:
+        data["tone_register"] = ["conversational"]
+
+    # practical_vs_theoretical (int 1-10, fallback to 5)
+    pvt = data.get("practical_vs_theoretical")
+    if isinstance(pvt, (int, float)):
+        data["practical_vs_theoretical"] = max(1, min(10, int(pvt)))
+    elif isinstance(pvt, str) and pvt.strip().isdigit():
+        data["practical_vs_theoretical"] = max(1, min(10, int(pvt.strip())))
+    else:
+        data["practical_vs_theoretical"] = 5
+
+    # conclusion_type (single enum, fallback to open_ended)
+    data["conclusion_type"] = _sanitize_single(
+        data.get("conclusion_type", ""), _VALID_CONCLUSION, _CONCLUSION_MAP, "open_ended")
+
+    # sub_type (single enum, fallback to other)
+    data["sub_type"] = _sanitize_single(
+        data.get("sub_type", ""), _VALID_SUBTYPE, _SUBTYPE_MAP, "other")
+
+    # ── Sub-type addendums (Session E) ──
+    # Each addendum is only populated when sub_type matches AND the model
+    # returned a dict for it. Otherwise stays None (the schema default).
+    # The model is instructed to use null for non-matching addendums.
+    # We always set all 11 addendum keys (to None or the sanitized data) so
+    # the **data splat into NonFictionInfo gives an explicit None for unused
+    # slots rather than relying on the schema default.
+
+    # Map sub_type → (addendum_key, sanitizer_function)
+    _ADDENDUM_DISPATCH = {
+        "self_help":            ("self_help",            _sanitize_self_help_addendum),
+        "memoir_biography":     ("memoir_biography",     _sanitize_memoir_biography_addendum),
+        "history_narrative":    ("history_narrative",    _sanitize_history_narrative_addendum),
+        "academic_textbook":    ("academic_textbook",    _sanitize_academic_textbook_addendum),
+        "popular_science":      ("popular_science",      _sanitize_popular_science_addendum),
+        "philosophy_religion":  ("philosophy_religion",  _sanitize_philosophy_religion_addendum),
+        "business_economics":   ("business_economics",   _sanitize_business_economics_addendum),
+        "health_fitness":       ("health_fitness",       _sanitize_health_fitness_addendum),
+        "cooking_food":         ("cooking_food",         _sanitize_cooking_food_addendum),
+        "travel_nature":        ("travel_nature",        _sanitize_travel_nature_addendum),
+        "true_crime":           ("true_crime",           _sanitize_true_crime_addendum),
+        # "other" intentionally absent — no addendum
+    }
+    # All possible addendum keys (always written as None unless matched)
+    _ALL_ADDENDUM_KEYS = [v[0] for v in _ADDENDUM_DISPATCH.values()]
+
+    matched_sub_type = data["sub_type"]
+    if matched_sub_type in _ADDENDUM_DISPATCH:
+        addendum_key, sanitizer_fn = _ADDENDUM_DISPATCH[matched_sub_type]
+        sanitized_addendum = sanitizer_fn(data.get(addendum_key))
+        # Clear all addendum slots, then set the matched one
+        for k in _ALL_ADDENDUM_KEYS:
+            data[k] = None
+        data[addendum_key] = sanitized_addendum
+    else:
+        # sub_type is "other" (or unexpected) — no addendum applies
+        for k in _ALL_ADDENDUM_KEYS:
+            data[k] = None
+
+    # Strip out any keys not in the NonFictionInfo schema so the **data splat
+    # doesn't choke on unexpected fields
+    allowed = {"thesis", "target_audience", "prerequisites", "structure_type",
+               "tone_register", "practical_vs_theoretical", "conclusion_type",
+               "sub_type"} | set(_ALL_ADDENDUM_KEYS)
+    return {k: v for k, v in data.items() if k in allowed}
+
+
+def _sanitize_nonfic_universal_data(data, extraction):
+    """
+    Validate and normalize the UNIVERSAL fields of the non-fiction Pass 2 output.
+    Returns a dict ready to construct a HolisticAnalysis (fiction-only fields
+    are populated with empty/default values).
+
+    Mirrors the relevant subset of _sanitize_holistic_data. Fiction-only fields
+    get explicit empty defaults so the resulting HolisticAnalysis still validates.
+    """
+    if not isinstance(data, dict):
+        data = {}
+    data = dict(data)
+
+    # title / author — fall back to extraction metadata if missing
+    if not isinstance(data.get("title"), str) or not data.get("title", "").strip():
+        data["title"] = getattr(extraction, "title", "") or "Unknown Title"
+    if not isinstance(data.get("author"), str) or not data.get("author", "").strip():
+        data["author"] = getattr(extraction, "author", "") or "Unknown Author"
+
+    # book_type: always non_fiction (we know this from detection)
+    data["book_type"] = "non_fiction"
+
+    # genre (single enum, fallback to "other")
+    g = data.get("genre")
+    if isinstance(g, str):
+        data["genre"] = _sanitize_single(g, _VALID_GENRES, _GENRE_MAP, "other")
+    else:
+        data["genre"] = "other"
+
+    # sub_genres (normalize against master list, dedupe, cap at 4)
+    if "sub_genres" in data and isinstance(data["sub_genres"], list):
+        norm = [_normalize_sub_genre(sg) for sg in data["sub_genres"] if isinstance(sg, str)]
+        seen_sg = set()
+        deduped = []
+        for s in norm:
+            if s and s.lower() not in seen_sg:
+                seen_sg.add(s.lower())
+                deduped.append(s)
+        data["sub_genres"] = deduped[:4] or ["nonfiction"]
+    else:
+        data["sub_genres"] = ["nonfiction"]
+
+    # ranked_themes (normalize against master, dedupe)
+    if "ranked_themes" in data and isinstance(data["ranked_themes"], list):
+        normalized = [_normalize_theme(t) for t in data["ranked_themes"] if isinstance(t, str)]
+        seen_t = set()
+        deduped = []
+        for t in normalized:
+            if t and t.lower() not in seen_t:
+                seen_t.add(t.lower())
+                deduped.append(t)
+        data["ranked_themes"] = deduped[:10]
+    else:
+        data["ranked_themes"] = []
+
+    # categories
+    if "categories" in data and isinstance(data["categories"], list):
+        norm = [_normalize_category(c) for c in data["categories"] if isinstance(c, str)]
+        data["categories"] = [c for c in norm if c][:3]
+    if not data.get("categories"):
+        data["categories"] = ["standalone"]
+
+    # reading_experience
+    if "reading_experience" in data and isinstance(data["reading_experience"], list):
+        exp = _sanitize_enum_list(
+            data["reading_experience"], _VALID_EXP, _EXP_MAP, "thought_provoking")
+        data["reading_experience"] = exp[:4]
+    else:
+        data["reading_experience"] = ["thought_provoking"]
+    if not data["reading_experience"]:
+        data["reading_experience"] = ["thought_provoking"]
+
+    # content_flags
+    if "content_flags" in data and isinstance(data["content_flags"], list):
+        data["content_flags"] = _sanitize_enum_list(
+            data["content_flags"], _VALID_FLAGS, _FLAG_MAP, "none")
+    else:
+        data["content_flags"] = ["none"]
+    if not data["content_flags"]:
+        data["content_flags"] = ["none"]
+
+    # setting (sanitize sub-fields)
+    if "setting" in data and isinstance(data["setting"], dict):
+        s = data["setting"]
+        s["primary_location"] = s.get("primary_location", "") if isinstance(s.get("primary_location"), str) else ""
+        s["time_period"] = _sanitize_single(
+            s.get("time_period", ""), _VALID_TIME, _TIME_MAP, "timeless_or_unspecified")
+        s["setting_type"] = _sanitize_single(
+            s.get("setting_type", ""), _VALID_SETTING, _SETTING_MAP, "domestic")
+        s["real_or_fictional"] = s.get("real_or_fictional", "real") if isinstance(s.get("real_or_fictional"), str) else "real"
+        addl = s.get("additional_locations", [])
+        s["additional_locations"] = [a for a in addl if isinstance(a, str)] if isinstance(addl, list) else []
+    else:
+        data["setting"] = {
+            "primary_location": "",
+            "time_period": "timeless_or_unspecified",
+            "setting_type": "domestic",
+            "real_or_fictional": "real",
+            "additional_locations": [],
+        }
+
+    # age_target (int 1-10, fallback to 7 — general adult reader)
+    at = data.get("age_target")
+    if isinstance(at, (int, float)):
+        data["age_target"] = max(1, min(10, int(at)))
+    elif isinstance(at, str) and at.strip().isdigit():
+        data["age_target"] = max(1, min(10, int(at.strip())))
+    else:
+        data["age_target"] = 7
+
+    # overall_summary
+    if not isinstance(data.get("overall_summary"), str) or not data["overall_summary"].strip():
+        data["overall_summary"] = "(Summary unavailable.)"
+    else:
+        data["overall_summary"] = data["overall_summary"].strip()[:2000]
+
+    # ── Fiction-only fields that HolisticAnalysis still requires — fill empty ──
+    # These are present in the HolisticAnalysis schema but irrelevant for non-fic.
+    # We populate with minimal valid defaults so HolisticAnalysis(**data) validates.
+    # Use enum .value references (not raw strings) so a typo would fail at import
+    # time rather than at runtime when the model tries to validate.
+    data["pov_types"] = [POVType.THIRD_PERSON_LIMITED.value]  # arbitrary valid; downstream ignores
+    data["pov_notes"] = ""
+    data["sad_ending"] = False
+    data["cliffhanger"] = False
+    data["ending_notes"] = ""
+    data["character_arcs"] = {}
+    data["character_genders"] = {}
+    data["character_archetypes"] = {}
+    data["character_ages"] = {}
+    data["ranked_characters"] = []
+    data["humor_types"] = [HumorType.NONE.value]
+
+    # Strip keys not in HolisticAnalysis schema so **data splat doesn't choke
+    allowed = {
+        "book_type", "genre", "sub_genres", "title", "author",
+        "pov_types", "pov_notes", "setting", "reading_experience",
+        "categories", "sad_ending", "cliffhanger", "ending_notes",
+        "age_target", "content_flags", "overall_summary",
+        "character_arcs", "character_genders", "character_archetypes",
+        "character_ages", "ranked_themes", "ranked_characters", "humor_types",
+    }
+    return {k: v for k, v in data.items() if k in allowed}
 
 
 def _build_fast_holistic_prompt(slim_analyses, extraction):
@@ -1499,7 +3196,7 @@ def aggregate_analysis_fast(slim_analyses, holistic, extraction):
             imp = 5
 
         characters.append(Character(
-            name=char_name, role="", importance=imp,
+            name=char_name, importance=imp,
             gender=gender, archetypes=char_archetypes,
             arc_summary=arc, age_category=age_cat))
 
@@ -1507,16 +3204,10 @@ def aggregate_analysis_fast(slim_analyses, holistic, extraction):
         humor_density=ratings.humor,
         primary_humor_types=holistic.humor_types if holistic.humor_types else [HumorType.NONE])
 
-    # Content flags: union from chunks, but capped at 4 by Pass 2
-    flags = set()
-    for sa in slim_analyses:
-        flags.update(sa.content_flags)
-    flags.update(holistic.content_flags)
-    flags.discard(ContentFlag.NONE)
-    # Use Pass 2's flags as the curated top 4
-    p2_flags = set(holistic.content_flags)
-    p2_flags.discard(ContentFlag.NONE)
-    cflags = sorted(p2_flags, key=lambda f: f.value)[:4] or [ContentFlag.NONE]
+    # Content flags: frequency-based, dynamically capped at 0-6
+    chunk_flag_lists = [list(sa.content_flags) for sa in slim_analyses]
+    cflags = _aggregate_content_flags(
+        chunk_flag_lists, list(holistic.content_flags), len(slim_analyses))
 
     return BookAnalysis(
         metadata=metadata, themes=themes,
@@ -1528,3 +3219,136 @@ def aggregate_analysis_fast(slim_analyses, holistic, extraction):
         sad_ending=holistic.sad_ending, cliffhanger=holistic.cliffhanger,
         ending_notes=holistic.ending_notes, content_flags=cflags,
         overall_summary=holistic.overall_summary)
+
+
+def aggregate_analysis_nonfic(pass1_analyses, holistic, nfi, extraction):
+    """
+    Non-fiction aggregator (Session D). Parallel to aggregate_analysis_fast,
+    but with fiction-specific fields populated from their schema defaults
+    (characters=[], humor=default profile, sad_ending=False, etc.) instead of
+    from holistic. The non_fiction_info block is populated from `nfi`.
+
+    Args:
+        pass1_analyses: list of ChunkAnalysis OR SlimChunkAnalysis (same as
+            the fiction aggregators — works either way because we only read
+            common fields: word_count, tone, readability, pace, age_target,
+            content_flags).
+        holistic: HolisticAnalysis produced by analyze_holistic_nonfic_full.
+            Has universal fields populated (genre, themes, categories, setting,
+            summary, etc.). Fiction-only fields in this object are minimal
+            defaults from the universal sanitizer — they get discarded here.
+        nfi: NonFictionInfo produced by analyze_holistic_nonfic_full.
+        extraction: ExtractionResult for metadata + computed stats.
+
+    Returns:
+        Complete BookAnalysis with non_fiction_info populated.
+
+    Design notes:
+        - Ratings violence/worldbuilding/humor/romance default to 1 (Optional
+          in schema). Pass 1 still produces per-chunk values for these but we
+          deliberately don't surface them for non-fiction — content_flags
+          handles content-warning use cases better than single integers.
+        - Themes come from holistic.ranked_themes (which the unified non-fic
+          Pass 2 populated). Same source as the fiction path.
+        - Characters list is empty. Pass 1's character_names for non-fiction
+          would mostly be the author or real people mentioned; capturing them
+          here would require addendum-specific logic (Session E for memoirs/
+          biographies/true_crime). For now: empty list.
+        - Setting comes from holistic.setting. For memoirs/history/travel/true
+          crime, the model populated real setting info. For self-help/etc.,
+          it's the minimal default.
+    """
+    def wavg(fn):
+        tw = sum(c.word_count for c in pass1_analyses) or 1
+        return max(1, min(10, round(sum(fn(c) * c.word_count for c in pass1_analyses) / tw)))
+
+    metadata = BookMetadata(
+        title=holistic.title, author=holistic.author,
+        book_type=holistic.book_type, genre=holistic.genre,
+        sub_genres=holistic.sub_genres,
+        publisher=extraction.pdf_metadata.publisher,
+        publish_year=extraction.pdf_metadata.publish_year,
+        language=_resolve_language(extraction.pdf_metadata.language),
+        isbn=extraction.pdf_metadata.isbn)
+
+    # Universal ratings: averaged from Pass 1 chunks. Fiction-specific ratings
+    # (violence/worldbuilding/humor/romance) default to 1 — they're Optional in
+    # the schema and content_flags handles content warnings better.
+    ratings = ContentRatings(
+        tone=wavg(lambda c: c.tone),
+        readability=wavg(lambda c: c.readability),
+        pace=wavg(lambda c: c.pace),
+        age_target=holistic.age_target,
+        # Fiction-specific ratings stay at their schema defaults (=1)
+    )
+
+    sentences = [s.strip() for s in extraction.full_text.split(".") if s.strip()]
+    asl = sum(len(s.split()) for s in sentences) / len(sentences) if sentences else 15.0
+    wpp = extraction.total_words / max(extraction.total_pages, 1)
+    wpm = max(100, min(400, 250 * (1.0 - (ratings.tone - 5) * 0.08)))
+
+    computed = ComputedStats(
+        total_words=extraction.total_words, total_pages=extraction.total_pages,
+        avg_sentence_length=round(asl, 1), avg_words_per_page=round(wpp, 1),
+        estimated_read_time_hours=round(extraction.total_words / wpm / 60, 2))
+
+    # Themes from Pass 2 rankings (unified non-fic Pass 2 produced these)
+    themes = []
+    for i, tn in enumerate(holistic.ranked_themes[:10]):
+        prom = max(4, 10 - i)
+        themes.append(Theme(name=tn.lower().strip(), prominence=prom))
+
+    # Content flags: same aggregation as fiction path. Non-fiction books still
+    # have meaningful content flags (war, abuse, death, trauma — these matter).
+    chunk_flag_lists = [list(getattr(sa, "content_flags", [])) for sa in pass1_analyses]
+    cflags = _aggregate_content_flags(
+        chunk_flag_lists, list(holistic.content_flags), len(pass1_analyses))
+
+    # Construct BookAnalysis. Fiction-specific fields explicitly use their
+    # schema defaults (characters=[], humor=default profile, pov=[], pov_notes="",
+    # sad_ending=False, cliffhanger=False, ending_notes="") via *omission* —
+    # the BookAnalysis class has default_factory for all of these (set up in A4).
+    return BookAnalysis(
+        metadata=metadata,
+        themes=themes,
+        categories=holistic.categories,
+        setting=holistic.setting,
+        ratings=ratings,
+        computed_stats=computed,
+        reading_experience=holistic.reading_experience,
+        content_flags=cflags,
+        overall_summary=holistic.overall_summary,
+        non_fiction_info=nfi,
+        # Fiction-specific fields omitted — they take their default_factory
+        # values from the BookAnalysis schema (empty list, default humor profile,
+        # False for sad_ending/cliffhanger, etc.)
+    )
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# NON-FICTION STUB (Session B)
+# ═══════════════════════════════════════════════════════════════════════════════
+# These placeholders let us wire detection + routing in Session B without
+# having the actual non-fiction Pass 2 prompt yet. Session C replaces the
+# stub-generating function with a real Pass 2 that populates NonFictionInfo
+# from actual book content.
+
+def make_stub_nonfic_info() -> NonFictionInfo:
+    """
+    Build a placeholder NonFictionInfo. Marked clearly so it's obvious in
+    output JSON that this is a stub, not real analysis.
+
+    Used by Session B routing for non-fiction books to verify the pipeline
+    can produce a valid BookAnalysis with non_fiction_info populated.
+    Session C replaces this with a real Pass 2 prompt + sanitizer.
+    """
+    return NonFictionInfo(
+        thesis="[STUB - Session B placeholder, real thesis arrives in Session C]",
+        target_audience=TargetAudience.GENERAL_READER,
+        prerequisites=[],
+        structure_type=StructureType.MIXED,
+        tone_register=[ToneRegister.CONVERSATIONAL],
+        practical_vs_theoretical=5,
+        conclusion_type=ConclusionType.OPEN_ENDED,
+        sub_type=BookSubType.OTHER,
+        # All 11 addendum slots remain None — populated in Session E
+    )

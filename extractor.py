@@ -105,17 +105,17 @@ CHAPTER_PATTERNS = [
 #               Dutch, Swedish, Norwegian, Danish, Polish, Russian (transliterated)
 _STORY_MARKERS = re.compile(
     r"(?i)^\s*("
-    # Chapter markers
-    r"chapter\s+\w|capitolo\s+\w|chapitre\s+\w|cap[ií]tulo\s+\w"
-    r"|kapitel\s+\w|hoofdstuk\s+\w|kapittel\s+\w|kapitola\s+\w"
-    r"|rozdzia[lł]\s+\w|глава\s+\w"
-    r"|cap\.\s*\w|ch\.\s*\d|chap\.\s*\d"
+    # Chapter markers (match full chapter number/word with \w+)
+    r"chapter\s+\w+|capitolo\s+\w+|chapitre\s+\w+|cap[ií]tulo\s+\w+"
+    r"|kapitel\s+\w+|hoofdstuk\s+\w+|kapittel\s+\w+|kapitola\s+\w+"
+    r"|rozdzia[lł]\s+\w+|глава\s+\w+"
+    r"|cap\.\s*\w+|ch\.\s*\d+|chap\.\s*\d+"
     # Part / book / volume markers
-    r"|part\s+\w|parte\s+\w|partie\s+\w|teil\s+\w|deel\s+\w|del\s+\w"
-    r"|book\s+(?:one|two|three|four|i|ii|iii|iv|v|\d)"
-    r"|volume\s+(?:one|two|i|ii|iii|\d)|libro\s+\w|livre\s+\w|buch\s+\w"
-    # Numbered sections (1. / I. / 01.)
-    r"|\d+\.\s+[A-Z]|[IVXLCDM]+\.\s+[A-Z]"
+    r"|part\s+\w+|parte\s+\w+|partie\s+\w+|teil\s+\w+|deel\s+\w+|del\s+\w+"
+    r"|book\s+(?:one|two|three|four|i|ii|iii|iv|v|\d+)"
+    r"|volume\s+(?:one|two|i|ii|iii|\d+)|libro\s+\w+|livre\s+\w+|buch\s+\w+"
+    # Numbered sections (1. / I. / 01. followed by title word)
+    r"|\d+\.\s+[A-Z]\w*|[IVXLCDM]+\.\s+[A-Z]\w*"
     # Prologue / Epilogue / Interlude (these ARE story content)
     r"|prologue|prologo|pr[oó]logo|prolog|proloog|forspill"
     r"|epilogue|epilogo|ep[ií]logo|epilog|epiloog|etterord"
@@ -385,6 +385,9 @@ def _is_back_matter_section(text: str, item_name: str = "") -> bool:
     return False
 
 
+_BARE_HEADING = re.compile(r"^(?:\d{1,3}|[IVXLCDM]{1,5})\.?$")
+
+
 def _is_story_section(text: str) -> bool:
     """
     Check if a section is definitively story content.
@@ -392,7 +395,21 @@ def _is_story_section(text: str) -> bool:
     """
     # Use raw text to preserve line breaks for MULTILINE regex
     opening = text[:400]
-    return bool(_STORY_MARKERS.search(opening))
+    if _STORY_MARKERS.search(opening):
+        return True
+
+    # Fallback: bare-numeric chapter heading as the FIRST line.
+    # Catches memoirs/novels that title chapters with just "1", "2", "II"
+    # without the word "Chapter" — a popular minimalist convention.
+    # Restricted to the first non-blank line so it can't false-trigger
+    # on numbers appearing mid-text.
+    stripped = text.lstrip()
+    if stripped:
+        first_line = stripped.split("\n", 1)[0].strip()
+        if first_line and _BARE_HEADING.match(first_line):
+            return True
+
+    return False
 
 
 def _trim_back_matter(pages: list[dict]) -> tuple[list[dict], list[str]]:
@@ -459,6 +476,99 @@ def _trim_back_matter(pages: list[dict]) -> tuple[list[dict], list[str]]:
     filtered = pages[:trim_from]
     skipped.reverse()  # Put in forward order for logging
     return filtered, skipped
+
+
+def _trim_body_boundaries(pages: list[dict], phase1_trimmed: int) -> tuple[list[dict], list[str]]:
+    """
+    Phase 2: Trim content OUTSIDE the main story body using story markers.
+
+    After Phase 1 (heading/filename-based back-matter trim), this pass finds
+    the first and last sections with story markers (chapter numbers, prologue,
+    epilogue) and trims everything outside those boundaries.
+
+    FRONT TRIM: Sections before the first story marker (book blurbs, author
+    info, title pages). Capped at 5 sections max.
+
+    TAIL TRIM: Sections between the last story marker and the Phase 1 trim
+    point. This catches bonus stories, short stories, and other content that
+    doesn't have back-matter headings but isn't part of the main narrative.
+
+    SAFETY RULES:
+    - Only runs if Phase 1 already trimmed something (confirms the book has
+      non-body content — if Phase 1 found nothing, Phase 2 stays quiet)
+    - Never trims sections WITH story markers (chapters/epilogues always safe)
+    - Front trim capped at 5 sections (most books have 1-3 front-matter pages)
+    - Total trim (Phase 1 + Phase 2) never exceeds 40% of original sections
+    - If no story markers found at all, does nothing
+
+    Args:
+        pages: sections remaining after Phase 1 trim
+        phase1_trimmed: how many sections Phase 1 already removed
+
+    Returns:
+        (filtered_pages, list_of_skipped_descriptions)
+    """
+    if phase1_trimmed == 0 or len(pages) < 3:
+        return pages, []
+
+    skipped = []
+    original_total = len(pages) + phase1_trimmed
+    max_total_removable = max(1, int(original_total * 0.4))
+    remaining_budget = max_total_removable - phase1_trimmed
+
+    if remaining_budget <= 0:
+        return pages, []
+
+    # ── Find first and last story markers ─────────────────────────────────
+    first_story_idx = -1
+    last_story_idx = -1
+    for i in range(len(pages)):
+        if _is_story_section(pages[i]["text"]):
+            if first_story_idx < 0:
+                first_story_idx = i
+            last_story_idx = i
+
+    # No story markers found — can't determine body boundaries
+    if first_story_idx < 0:
+        return pages, []
+
+    # ── Front trim: sections before the first story marker ────────────────
+    # Only trim if first marker is within the first 6 sections (positions 0-5)
+    # and we have budget remaining
+    front_trim = 0
+    if first_story_idx > 0 and first_story_idx <= 5:
+        front_trim = min(first_story_idx, remaining_budget)
+        for i in range(front_trim):
+            section = pages[i]
+            item_name = section.get("item_name", "")
+            word_count = len(section["text"].split())
+            skipped.append(
+                f"{item_name or f'section {i+1}'} ({word_count}w, front matter)")
+        remaining_budget -= front_trim
+
+    # ── Tail trim: sections after the last story marker ───────────────────
+    # Adjust last_story_idx for front trim offset
+    adjusted_last_story = last_story_idx - front_trim
+    tail_start = adjusted_last_story + 1
+    pages_after_front = pages[front_trim:]
+
+    tail_trim_count = 0
+    if tail_start < len(pages_after_front) and remaining_budget > 0:
+        gap_sections = pages_after_front[tail_start:]
+        trim_count = min(len(gap_sections), remaining_budget)
+
+        for i in range(trim_count):
+            section = gap_sections[i]
+            item_name = section.get("item_name", "")
+            word_count = len(section["text"].split())
+            skipped.append(
+                f"{item_name or 'unnamed'} ({word_count}w, outside body)")
+            tail_trim_count += 1
+
+        pages_after_front = pages_after_front[:tail_start]
+
+    result = pages_after_front
+    return result, skipped
 
 
 def extract_text(file_path: str) -> ExtractionResult:
@@ -534,9 +644,16 @@ def extract_text_from_pdf(pdf_path: str) -> ExtractionResult:
         logger.info("No chapters detected — using windowed chunking")
         chunks = _segment_by_window(pages, target_words=4000, overlap_words=300)
 
-    # ── Enforce max chunk size ────────────────────────────────────────────
+    # ── Merge small consecutive chunks (target ~10k words, cap at 15k) ────
+    pre_merge_count = len(chunks)
+    chunks = _merge_small_chunks(chunks, target_words=8000, max_words=12000)
+    if len(chunks) < pre_merge_count:
+        logger.info(f"  Merged {pre_merge_count} chapter chunks into {len(chunks)} "
+                     f"larger chunks (target ~8k words each)")
+
+    # ── Enforce max chunk size (split any chunk larger than the cap) ──────
     final_chunks: list[TextChunk] = []
-    max_words = 5000
+    max_words = 12000
     for chunk in chunks:
         if chunk.word_count > max_words:
             sub_chunks = _split_large_chunk(chunk, max_words=max_words)
@@ -761,6 +878,90 @@ def _split_large_chunk(chunk: TextChunk, max_words: int) -> list[TextChunk]:
     return sub_chunks
 
 
+def _merge_small_chunks(chunks: list[TextChunk], target_words: int = 8000,
+                         max_words: int = 12000) -> list[TextChunk]:
+    """
+    Greedy merger of consecutive chunks. Combines small chunks (typically
+    short chapters) into larger groups so the analysis pipeline pays
+    less per-call scaffolding overhead.
+
+    Rules:
+      - Walk chunks in order; build groups of consecutive chunks.
+      - A chunk is added to the current group only if:
+          combined_words + chunk.word_count <= max_words
+        AND
+          combined_words < target_words (don't keep merging once target met)
+      - Single chunks already >= target_words pass through alone (no merging).
+      - Single chunks already > max_words also pass through (the downstream
+        cap-check splitter handles them).
+      - Order is preserved — chunks never reorder.
+
+    Args:
+        chunks: input list of TextChunks (already chapter-segmented)
+        target_words: ideal merged-chunk size (soft target)
+        max_words: hard cap; merged chunks never exceed this
+
+    Returns:
+        New list of TextChunks. Indices are not renumbered (caller does that).
+    """
+    if not chunks:
+        return chunks
+
+    merged: list[TextChunk] = []
+    current_group: list[TextChunk] = []
+    current_words = 0
+
+    def flush_group():
+        nonlocal current_group, current_words
+        if not current_group:
+            return
+        if len(current_group) == 1:
+            merged.append(current_group[0])
+        else:
+            first = current_group[0]
+            last = current_group[-1]
+            label = (first.label if first.label == last.label
+                     else f"{first.label}–{last.label}")
+            text = "\n\n".join(c.text for c in current_group)
+            merged.append(TextChunk(
+                index=0,  # caller renumbers
+                label=label,
+                text=text,
+                page_start=first.page_start,
+                page_end=last.page_end,
+            ))
+        current_group = []
+        current_words = 0
+
+    for c in chunks:
+        # If this chunk alone meets/exceeds target, flush + emit alone
+        if c.word_count >= target_words:
+            flush_group()
+            merged.append(c)
+            continue
+
+        # If adding this chunk would exceed cap, flush first
+        if current_words + c.word_count > max_words:
+            flush_group()
+            current_group.append(c)
+            current_words = c.word_count
+            continue
+
+        # If current group already at/over target, close and start new
+        if current_words >= target_words:
+            flush_group()
+            current_group.append(c)
+            current_words = c.word_count
+            continue
+
+        # Otherwise, add to current group
+        current_group.append(c)
+        current_words += c.word_count
+
+    flush_group()
+    return merged
+
+
 def _offset_to_page(offset: int, page_offsets: list[tuple[int, int, int]]) -> int:
     for start, end, page in page_offsets:
         if start <= offset < end:
@@ -812,7 +1013,7 @@ def extract_text_from_epub(epub_path: str) -> ExtractionResult:
         page_num += 1
         raw_pages.append({"page": page_num, "text": text, "item_name": item_name})
 
-    # ── Trim back-matter from the tail ────────────────────────────────────
+    # ── Phase 1: Trim confirmed back-matter from the tail ───────────────
     # Scans backwards from end, stops at first story section or ambiguous section
     pages, skipped_back_matter = _trim_back_matter(raw_pages)
 
@@ -820,6 +1021,16 @@ def extract_text_from_epub(epub_path: str) -> ExtractionResult:
         logger.info(f"  Trimmed {len(skipped_back_matter)} back-matter section(s) "
                      f"from end: {', '.join(skipped_back_matter)}")
         warnings.append(f"Trimmed {len(skipped_back_matter)} back-matter section(s) from end")
+
+    # ── Phase 2: Trim content outside the story body ──────────────────────
+    # Uses story markers (chapter numbers, prologue, epilogue) to find the
+    # actual narrative boundaries. Trims front matter and bonus content.
+    pages, skipped_body = _trim_body_boundaries(pages, len(skipped_back_matter))
+
+    if skipped_body:
+        logger.info(f"  Trimmed {len(skipped_body)} non-body section(s): "
+                     f"{', '.join(skipped_body)}")
+        warnings.append(f"Trimmed {len(skipped_body)} non-body section(s)")
 
     if not pages:
         warnings.append("No text extracted from EPUB")
@@ -848,21 +1059,24 @@ def extract_text_from_epub(epub_path: str) -> ExtractionResult:
     closing_text = _extract_closing(pages, target_words=1500)
 
     # ── Segment into chunks ───────────────────────────────────────────────
-    # EPUBs have natural chapter boundaries from their HTML sections.
-    # Each "page" in our list is already roughly a chapter.
-    # If sections are very short, merge adjacent ones.
-    # If sections are very long, split them.
+    # EPUBs have natural chapter boundaries built into the format — one HTML
+    # file per chapter. Prefer those over running regex chapter detection on
+    # the merged text, because:
+    #   (a) Many EPUBs use bare-number chapter labels ("1", "2", ...) that
+    #       text-pattern detection doesn't recognize.
+    #   (b) Many EPUBs embed TOC navigation strips or accessibility text
+    #       ("Chapter 1", "Chapter 2", ...) that creates *false* break points
+    #       far from the real chapter starts — leading to tiny/empty chunks.
+    # If the EPUB has at least 5 sections after trimming, its structure is
+    # trustworthy. Otherwise fall back to text-pattern detection (handles
+    # single-file EPUBs where all chapters live in one HTML document).
 
-    # First try chapter detection in the full text (same as PDF)
-    chunks = _segment_by_chapters(pages)
+    chunks: list[TextChunk] = []
 
-    if not chunks:
-        # Use EPUB sections as natural chapters
-        # Merge very short adjacent sections (< 500 words)
+    if len(pages) >= 5:
+        # EPUB has clear chapter structure — use it directly.
         merged_pages = _merge_short_epub_sections(pages, min_words=500)
-
         if len(merged_pages) >= 2:
-            chunks = []
             for i, p in enumerate(merged_pages):
                 chunks.append(TextChunk(
                     index=i,
@@ -871,14 +1085,27 @@ def extract_text_from_epub(epub_path: str) -> ExtractionResult:
                     page_start=p["page"],
                     page_end=p["page"],
                 ))
-        else:
-            # Fall back to windowed chunking
-            logger.info("EPUB has no clear sections — using windowed chunking")
-            chunks = _segment_by_window(pages, target_words=4000, overlap_words=300)
 
-    # ── Enforce max chunk size ────────────────────────────────────────────
+    if not chunks:
+        # Single-file EPUB (or very short book) — try text-pattern chapter
+        # detection on the merged text.
+        chunks = _segment_by_chapters(pages)
+
+    if not chunks:
+        # Last resort — windowed chunking.
+        logger.info("EPUB has no clear sections — using windowed chunking")
+        chunks = _segment_by_window(pages, target_words=4000, overlap_words=300)
+
+    # ── Merge small consecutive chunks (target ~10k words, cap at 15k) ────
+    pre_merge_count = len(chunks)
+    chunks = _merge_small_chunks(chunks, target_words=8000, max_words=12000)
+    if len(chunks) < pre_merge_count:
+        logger.info(f"  Merged {pre_merge_count} chapter chunks into {len(chunks)} "
+                     f"larger chunks (target ~8k words each)")
+
+    # ── Enforce max chunk size (split any chunk larger than the cap) ──────
     final_chunks: list[TextChunk] = []
-    max_words = 5000
+    max_words = 12000
     for chunk in chunks:
         if chunk.word_count > max_words:
             sub_chunks = _split_large_chunk(chunk, max_words=max_words)

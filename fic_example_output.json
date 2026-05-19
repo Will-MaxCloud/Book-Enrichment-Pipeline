@@ -1,0 +1,175 @@
+{
+  "metadata": {
+    "title": "The Great Gatsby",
+    "author": "F. Scott Fitzgerald",
+    "book_type": "fiction",
+    "genre": "literary_fiction",
+    "sub_genres": [
+      "20th century classics",
+      "tragedy",
+      "satirical fiction"
+    ],
+    "publisher": "Charles Scribner's Sons",
+    "publish_year": 1925,
+    "language": "English",
+    "isbn": null
+  },
+  "themes": [
+    {
+      "name": "wealth and materialism",
+      "prominence": 10
+    },
+    {
+      "name": "disillusionment",
+      "prominence": 9
+    },
+    {
+      "name": "class and social inequality",
+      "prominence": 8
+    },
+    {
+      "name": "masks and hidden selves",
+      "prominence": 7
+    },
+    {
+      "name": "love and romance",
+      "prominence": 6
+    },
+    {
+      "name": "time and memory",
+      "prominence": 6
+    },
+    {
+      "name": "moral ambiguity",
+      "prominence": 5
+    },
+    {
+      "name": "consequences of choices",
+      "prominence": 4
+    }
+  ],
+  "categories": [
+    "unreliable narrator",
+    "historical setting",
+    "dark and gritty"
+  ],
+  "characters": [
+    {
+      "name": "Jay Gatsby",
+      "role": "",
+      "importance": 10,
+      "gender": "male",
+      "archetypes": [
+        "tragic_hero",
+        "unlikely_hero"
+      ],
+      "arc_summary": "A self-invented millionaire who spends five years engineering a reunion with his lost love Daisy, only to discover his idealized vision of her was always an illusion; he is killed before he can come to terms with his failure.",
+      "age_category": "adult"
+    },
+    {
+      "name": "Nick Carraway",
+      "role": "",
+      "importance": 9,
+      "gender": "male",
+      "archetypes": [
+        "narrator_observer",
+        "everyman"
+      ],
+      "arc_summary": "Arrives in New York open-minded and curious, becomes gradually implicated in the carelessness of the wealthy, and departs thoroughly disillusioned — the only character who genuinely mourns Gatsby.",
+      "age_category": "young_adult"
+    },
+    {
+      "name": "Daisy Buchanan",
+      "role": "",
+      "importance": 8,
+      "gender": "female",
+      "archetypes": [
+        "love_interest",
+        "anti_hero"
+      ],
+      "arc_summary": "Functions as the object of Gatsby's obsession but reveals herself to be fundamentally self-interested; after Gatsby's death she retreats with Tom without sending flowers or attending the funeral.",
+      "age_category": "adult"
+    },
+    {
+      "name": "Tom Buchanan",
+      "role": "",
+      "importance": 7,
+      "gender": "male",
+      "archetypes": [
+        "villain",
+        "anti_hero"
+      ],
+      "arc_summary": "An old-money bully whose racism, infidelity, and casual cruelty remain consequence-free throughout; he manipulates the situation surrounding Myrtle's death to destroy Gatsby and walks away untouched.",
+      "age_category": "adult"
+    },
+    {
+      "name": "Jordan Baker",
+      "role": "",
+      "importance": 5,
+      "gender": "female",
+      "archetypes": [
+        "trickster",
+        "narrator_observer"
+      ],
+      "arc_summary": "Serves as Nick's romantic interest and a window into old-money social circles; her casual dishonesty mirrors the broader moral carelessness of the world Nick ultimately rejects.",
+      "age_category": "young_adult"
+    }
+  ],
+  "setting": {
+    "primary_location": "Long Island, New York",
+    "time_period": "1920s",
+    "setting_type": "suburban",
+    "real_or_fictional": "mixed",
+    "additional_locations": [
+      "Manhattan",
+      "Valley of Ashes",
+      "West Egg",
+      "East Egg"
+    ]
+  },
+  "ratings": {
+    "tone": 7,
+    "readability": 4,
+    "violence": 3,
+    "age_target": 7,
+    "pace": 5,
+    "worldbuilding": 4,
+    "humor": 3,
+    "romance": 5
+  },
+  "computed_stats": {
+    "total_words": 47094,
+    "total_pages": 180,
+    "avg_sentence_length": 18.3,
+    "avg_words_per_page": 261.6,
+    "estimated_read_time_hours": 3.4
+  },
+  "humor": {
+    "humor_density": 3,
+    "primary_humor_types": [
+      "dry_wit",
+      "irony"
+    ]
+  },
+  "pov": [
+    "first_person"
+  ],
+  "pov_notes": "Retrospective first-person narration through Nick Carraway, whose selective memory and moral framing act as a filter on all events.",
+  "reading_experience": [
+    "atmospheric",
+    "thought_provoking",
+    "bittersweet"
+  ],
+  "sad_ending": true,
+  "cliffhanger": false,
+  "ending_notes": "Gatsby is shot dead in his pool; Nick arranges a poorly-attended funeral, breaks with the East Coast social world, and ends on the novel's elegiac final image of being ceaselessly borne back into the past.",
+  "content_flags": [
+    "death",
+    "substance_abuse",
+    "discrimination",
+    "strong_language"
+  ],
+  "overall_summary": "Set during the Jazz Age on Long Island, The Great Gatsby follows narrator Nick Carraway as he observes the obsessive campaign of self-made millionaire Jay Gatsby to recapture a romance with the married Daisy Buchanan. Fitzgerald uses the geography of East Egg versus West Egg as a precise map of class immobility — old money versus new — to show that no amount of wealth can breach the wall of inherited status. Gatsby's dream is destroyed not by bad luck but by the fundamental carelessness of the rich, and the novel closes as one of American literature's most precise autopsies of national mythology.",
+  "non_fiction_info": null,
+  "analysis_version": "4.0.0"
+}

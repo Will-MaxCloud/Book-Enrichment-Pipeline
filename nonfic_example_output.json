@@ -1,0 +1,185 @@
+{
+  "metadata": {
+    "title": "Sapiens: A Brief History of Humankind",
+    "author": "Yuval Noah Harari",
+    "book_type": "non_fiction",
+    "genre": "history",
+    "sub_genres": [
+      "world history",
+      "social & cultural history",
+      "anthropology"
+    ],
+    "publisher": "Harper",
+    "publish_year": 2015,
+    "language": "English",
+    "isbn": "9780062316097"
+  },
+  "themes": [
+    {
+      "name": "humanity vs nature",
+      "prominence": 10
+    },
+    {
+      "name": "power and corruption",
+      "prominence": 8
+    },
+    {
+      "name": "knowledge and ignorance",
+      "prominence": 8
+    },
+    {
+      "name": "technology and progress",
+      "prominence": 7
+    },
+    {
+      "name": "colonialism and imperialism",
+      "prominence": 6
+    },
+    {
+      "name": "truth and deception",
+      "prominence": 6
+    },
+    {
+      "name": "meaning of life",
+      "prominence": 5
+    },
+    {
+      "name": "class and social inequality",
+      "prominence": 5
+    },
+    {
+      "name": "revolution and rebellion",
+      "prominence": 4
+    },
+    {
+      "name": "death and mortality",
+      "prominence": 4
+    }
+  ],
+  "categories": [
+    "mind-bending",
+    "epic in scope",
+    "true events based"
+  ],
+  "characters": [
+    {
+      "name": "Yuval Noah Harari",
+      "role": "",
+      "importance": 10,
+      "gender": "male",
+      "archetypes": [
+        "narrator_observer",
+        "wise_elder"
+      ],
+      "arc_summary": "Serves as the book's sole guiding voice — a scholar synthesizing archaeology, biology, and economics into a single sweeping argument about how shared myths and collective imagination drove Homo sapiens to become the planet's dominant species.",
+      "age_category": "adult"
+    },
+    {
+      "name": "Charles Darwin",
+      "role": "",
+      "importance": 6,
+      "gender": "male",
+      "archetypes": [
+        "wise_elder"
+      ],
+      "arc_summary": "Invoked as the foundational figure whose theory of evolution underpins Harari's argument that Homo sapiens is one animal among many, shaped by the same blind forces of natural selection before breaking free of them.",
+      "age_category": "adult"
+    },
+    {
+      "name": "Adam Smith",
+      "role": "",
+      "importance": 5,
+      "gender": "male",
+      "archetypes": [
+        "mentor"
+      ],
+      "arc_summary": "Cited as the intellectual architect of the capitalist myth — the belief that individual self-interest aggregates into collective prosperity — which Harari presents as one of history's most powerful and consequential shared fictions.",
+      "age_category": "adult"
+    }
+  ],
+  "setting": {
+    "primary_location": "Global — every inhabited continent across 70,000 years",
+    "time_period": "multiple_time_periods",
+    "setting_type": "rural",
+    "real_or_fictional": "real",
+    "additional_locations": [
+      "Africa",
+      "Eurasia",
+      "the Americas",
+      "the Pacific"
+    ]
+  },
+  "ratings": {
+    "tone": 5,
+    "readability": 6,
+    "violence": 1,
+    "age_target": 7,
+    "pace": 6,
+    "worldbuilding": 1,
+    "humor": 3,
+    "romance": 1
+  },
+  "computed_stats": {
+    "total_words": 122000,
+    "total_pages": 443,
+    "avg_sentence_length": 17.4,
+    "avg_words_per_page": 275.4,
+    "estimated_read_time_hours": 9.38
+  },
+  "reading_experience": [
+    "thought_provoking",
+    "educational",
+    "epic_in_scope",
+    "immersive"
+  ],
+  "humor": {
+    "humor_density": 3,
+    "primary_humor_types": [
+      "dry_wit",
+      "irony"
+    ]
+  },
+  "pov": [
+    "third_person_omniscient"
+  ],
+  "pov_notes": "Harari writes as an authoritative third-person narrator, occasionally breaking into direct address to challenge the reader's assumptions.",
+  "content_flags": [
+    "war",
+    "discrimination",
+    "slavery"
+  ],
+  "sad_ending": false,
+  "cliffhanger": false,
+  "ending_notes": "Closes on an open and unsettling note — Harari questions whether humanity's rise has made us happier, and turns to biotechnology and the prospect of self-engineered post-human species as the next chapter of the story.",
+  "overall_summary": "Sapiens traces the full arc of human history from a minor East African ape to the ruler of the planet, arguing that what made Homo sapiens unique was the capacity to believe in shared fictions — money, nations, religions, corporations. Harari moves through the Cognitive Revolution, the Agricultural Revolution, the rise of empire and capitalism, and the Scientific Revolution with the same analytical lens: that the stories we collectively believe are the actual levers of history. The book ends not with triumph but with a provocative question about whether any of it has made us genuinely happier, and what it means that we are now engineering life itself.",
+  "non_fiction_info": {
+    "thesis": "Homo sapiens came to dominate the planet not through superior strength or intelligence, but through a unique ability to cooperate in large numbers via shared belief in imagined realities — myths, religions, laws, money — and this capacity for collective fiction-making explains every major revolution in human history.",
+    "target_audience": "general_reader",
+    "prerequisites": [],
+    "structure_type": "linear_argument",
+    "tone_register": [
+      "conversational",
+      "sobering",
+      "witty"
+    ],
+    "practical_vs_theoretical": 2,
+    "conclusion_type": "open_ended",
+    "sub_type": "history_narrative",
+    "self_help": null,
+    "memoir_biography": null,
+    "history_narrative": {
+      "historical_period": "70,000 BCE to the present day",
+      "geographic_focus": "Global",
+      "perspective_centered": "global"
+    },
+    "academic_textbook": null,
+    "popular_science": null,
+    "philosophy_religion": null,
+    "business_economics": null,
+    "health_fitness": null,
+    "cooking_food": null,
+    "travel_nature": null,
+    "true_crime": null
+  },
+  "analysis_version": "4.0.0"
+}

@@ -371,6 +371,16 @@ class CharacterArchetype(str, Enum):
     OTHER = "other"
 
 
+class AgeCategory(str, Enum):
+    """Character age bracket. None / missing is a valid state ('unknown')."""
+    CHILD = "child"          # roughly 0-12
+    TEEN = "teen"            # roughly 13-17
+    YOUNG_ADULT = "young_adult"  # roughly 18-29
+    ADULT = "adult"          # roughly 30-59
+    ELDERLY = "elderly"      # roughly 60+
+    AGELESS = "ageless"      # immortals, gods, AIs, supernatural beings, etc.
+
+
 class POVType(str, Enum):
     FIRST_PERSON = "first_person"
     SECOND_PERSON = "second_person"
@@ -492,8 +502,347 @@ class BookType(str, Enum):
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
+# NON-FICTION ENUMS
+# ═══════════════════════════════════════════════════════════════════════════════
+# These enums support the NonFictionInfo block on BookAnalysis. They are used
+# only when a book is detected as non-fiction. See NONFICTION_DESIGN.md for the
+# full design rationale.
+
+class BookSubType(str, Enum):
+    """Sub-type of non-fiction book. Determines which addendum (if any) applies."""
+    SELF_HELP = "self_help"
+    MEMOIR_BIOGRAPHY = "memoir_biography"
+    HISTORY_NARRATIVE = "history_narrative"
+    ACADEMIC_TEXTBOOK = "academic_textbook"
+    POPULAR_SCIENCE = "popular_science"
+    PHILOSOPHY_RELIGION = "philosophy_religion"
+    BUSINESS_ECONOMICS = "business_economics"
+    HEALTH_FITNESS = "health_fitness"
+    COOKING_FOOD = "cooking_food"
+    TRAVEL_NATURE = "travel_nature"
+    TRUE_CRIME = "true_crime"
+    OTHER = "other"
+
+
+class TargetAudience(str, Enum):
+    """Who is this book for?"""
+    BEGINNER = "beginner"
+    INTERMEDIATE = "intermediate"
+    ADVANCED = "advanced"
+    GENERAL_READER = "general_reader"
+    SPECIALIST = "specialist"
+
+
+class StructureType(str, Enum):
+    """How is the book organized? Affects whether readers can skip around."""
+    LINEAR_ARGUMENT = "linear_argument"
+    EPISODIC_CHAPTERS = "episodic_chapters"
+    CASE_STUDIES = "case_studies"
+    REFERENCE = "reference"
+    WORKBOOK = "workbook"
+    MIXED = "mixed"
+
+
+class ToneRegister(str, Enum):
+    """Writing voice / tone for non-fiction. Replaces fiction's tone scale."""
+    ACADEMIC = "academic"
+    CONVERSATIONAL = "conversational"
+    INSPIRATIONAL = "inspirational"
+    SOBERING = "sobering"
+    WITTY = "witty"
+    DENSE = "dense"
+    BREEZY = "breezy"
+
+
+class ConclusionType(str, Enum):
+    """How does the book conclude? Replaces sad_ending/cliffhanger for non-fiction."""
+    OPTIMISTIC = "optimistic"
+    CAUTIONARY = "cautionary"
+    OPEN_ENDED = "open_ended"
+    DEFINITIVE = "definitive"
+    PROVOCATIVE = "provocative"
+    HOPEFUL = "hopeful"
+
+
+# ── Addendum-specific enums ────────────────────────────────────────────────────
+
+class CommitmentLevel(str, Enum):
+    """For self-help books: how much effort does this require?"""
+    QUICK_READ = "quick_read"
+    CASUAL_APPLICATION = "casual_application"
+    SERIOUS_PRACTICE = "serious_practice"
+
+
+class NarrativeShape(str, Enum):
+    """For memoirs/biographies: the narrative arc."""
+    TRIUMPH = "triumph"
+    CAUTIONARY = "cautionary"
+    WITNESS = "witness"
+    SURVIVAL = "survival"
+    COMING_OF_AGE = "coming_of_age"
+    OTHER = "other"
+
+
+class SubjectRelationship(str, Enum):
+    """For memoirs/biographies: author's relationship to subject."""
+    AUTOBIOGRAPHICAL = "autobiographical"
+    AUTHORIZED = "authorized"
+    UNAUTHORIZED = "unauthorized"
+    SCHOLARLY = "scholarly"
+
+
+class HistoricalPerspective(str, Enum):
+    """For history books: whose perspective is centered?"""
+    GREAT_FIGURES = "great_figures"
+    EVERYDAY_PEOPLE = "everyday_people"
+    SPECIFIC_COMMUNITY = "specific_community"
+    GLOBAL = "global"
+
+
+class AcademicLevel(str, Enum):
+    """For textbooks: intended educational level."""
+    UNDERGRADUATE = "undergraduate"
+    GRADUATE = "graduate"
+    PROFESSIONAL = "professional"
+    INTRO_SURVEY = "intro_survey"
+
+
+class PhilosophyFocus(str, Enum):
+    """For philosophy/religion books: primary orientation."""
+    THEORETICAL = "theoretical"
+    PRACTICAL = "practical"
+    DEVOTIONAL = "devotional"
+    HISTORICAL = "historical"
+
+
+class BusinessAudienceRole(str, Enum):
+    """For business books: who is the target role?"""
+    FOUNDER = "founder"
+    MANAGER = "manager"
+    INDIVIDUAL_CONTRIBUTOR = "individual_contributor"
+    GENERAL = "general"
+
+
+class HealthEvidenceBasis(str, Enum):
+    """For health/fitness books: what kind of evidence backs the claims?"""
+    CLINICAL_RESEARCH = "clinical_research"
+    PRACTITIONER_EXPERIENCE = "practitioner_experience"
+    ANECDOTAL = "anecdotal"
+    MIXED = "mixed"
+
+
+class RecipeDifficulty(str, Enum):
+    """For cookbooks: skill level expected of the reader."""
+    BEGINNER = "beginner"
+    INTERMEDIATE = "intermediate"
+    ADVANCED = "advanced"
+    MIXED = "mixed"
+
+
+class CookbookPurpose(str, Enum):
+    """For cookbooks: what role does the book serve?"""
+    RECIPE_COLLECTION = "recipe_collection"
+    TECHNIQUE = "technique"
+    FOOD_NARRATIVE = "food_narrative"
+    DIETARY_PROGRAM = "dietary_program"
+
+
+class TravelStyle(str, Enum):
+    """For travel books: what style of travel?"""
+    ADVENTURE = "adventure"
+    CULTURAL = "cultural"
+    NATURE = "nature"
+    LUXURY = "luxury"
+    BUDGET = "budget"
+    MIXED = "mixed"
+
+
+class TrueCrimeCaseType(str, Enum):
+    """For true crime books: scope of cases covered."""
+    SINGLE_CASE = "single_case"
+    MULTIPLE_CASES = "multiple_cases"
+    PATTERN_ANALYSIS = "pattern_analysis"
+
+
+class TrueCrimeResolution(str, Enum):
+    """For true crime books: how the case stands."""
+    SOLVED = "solved"
+    UNSOLVED = "unsolved"
+    COLD_CASE = "cold_case"
+    ONGOING = "ongoing"
+
+
+class TrueCrimePerspective(str, Enum):
+    """For true crime books: from whose viewpoint."""
+    JOURNALIST = "journalist"
+    LAW_ENFORCEMENT = "law_enforcement"
+    FAMILY = "family"
+    ACADEMIC = "academic"
+    PERPETRATOR = "perpetrator"
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
 # SUB-MODELS
 # ═══════════════════════════════════════════════════════════════════════════════
+
+# ── Non-fiction sub-type addendums ─────────────────────────────────────────────
+# Each addendum holds 3-4 sub-type-specific fields. A non-fiction book has at
+# most ONE addendum populated, based on its detected BookSubType. All addendum
+# fields use Optional types so the model still validates when fields cannot be
+# determined from the source text.
+
+class SelfHelpAddendum(BaseModel):
+    """Self-help, how-to, and instructional books."""
+    skill_or_outcome: Optional[str] = Field(
+        default=None, description="What the reader will be able to do after reading")
+    has_exercises: Optional[bool] = Field(
+        default=None, description="True if the book contains exercises, prompts, or worksheets")
+    commitment_level: Optional[CommitmentLevel] = Field(default=None)
+
+
+class MemoirBiographyAddendum(BaseModel):
+    """Memoirs, autobiographies, and biographies."""
+    life_period_covered: Optional[str] = Field(
+        default=None, description="What span of the subject's life is covered")
+    narrative_shape: Optional[NarrativeShape] = Field(default=None)
+    subject_relationship: Optional[SubjectRelationship] = Field(default=None)
+
+
+class HistoryNarrativeAddendum(BaseModel):
+    """Histories and narrative non-fiction (including journalism)."""
+    historical_period: Optional[str] = Field(
+        default=None, description="The time period the book focuses on")
+    geographic_focus: Optional[str] = Field(
+        default=None, description="The region, country, or area covered")
+    perspective_centered: Optional[HistoricalPerspective] = Field(default=None)
+
+
+class AcademicTextbookAddendum(BaseModel):
+    """Academic texts, textbooks, and reference works."""
+    discipline: Optional[str] = Field(
+        default=None, description="Field of study (e.g., 'biochemistry', 'literary theory')")
+    level: Optional[AcademicLevel] = Field(default=None)
+    has_exercises: Optional[bool] = Field(
+        default=None, description="True if includes problem sets, exercises, or review questions")
+
+
+class PopularScienceAddendum(BaseModel):
+    """Popular science, nature writing, science journalism."""
+    scientific_domain: Optional[str] = Field(
+        default=None, description="The branch of science covered (e.g., 'cosmology', 'neuroscience')")
+    accessibility_score: Optional[int] = Field(
+        default=None, ge=1, le=10,
+        description="1=requires deep prior knowledge; 10=fully accessible to any reader")
+    is_cutting_edge: Optional[bool] = Field(
+        default=None, description="True if it covers recent or developing science")
+
+
+class PhilosophyReligionAddendum(BaseModel):
+    """Philosophy, religion, and spirituality books."""
+    tradition: Optional[str] = Field(
+        default=None,
+        description="Tradition or school (e.g., 'analytic philosophy', 'Zen Buddhism', 'Catholic theology')")
+    focus: Optional[PhilosophyFocus] = Field(default=None)
+
+
+class BusinessEconomicsAddendum(BaseModel):
+    """Business, economics, leadership, and management books."""
+    domain: Optional[str] = Field(
+        default=None,
+        description="Specific area (e.g., 'leadership', 'strategy', 'behavioral economics')")
+    audience_role: Optional[BusinessAudienceRole] = Field(default=None)
+
+
+class HealthFitnessAddendum(BaseModel):
+    """Health, fitness, nutrition, and wellness books."""
+    focus_area: Optional[str] = Field(
+        default=None,
+        description="Specific health domain (e.g., 'nutrition', 'strength training', 'sleep', 'mental health')")
+    evidence_basis: Optional[HealthEvidenceBasis] = Field(default=None)
+
+
+class CookingFoodAddendum(BaseModel):
+    """Cookbooks and food writing."""
+    cuisine_type: Optional[str] = Field(
+        default=None, description="Cuisine or food tradition (e.g., 'French', 'plant-based', 'BBQ')")
+    recipe_difficulty: Optional[RecipeDifficulty] = Field(default=None)
+    book_purpose: Optional[CookbookPurpose] = Field(default=None)
+
+
+class TravelNatureAddendum(BaseModel):
+    """Travel writing and nature/wilderness writing."""
+    location_focus: Optional[str] = Field(
+        default=None, description="Primary location or region covered")
+    travel_style: Optional[TravelStyle] = Field(default=None)
+
+
+class TrueCrimeAddendum(BaseModel):
+    """True crime books."""
+    case_type: Optional[TrueCrimeCaseType] = Field(default=None)
+    resolution: Optional[TrueCrimeResolution] = Field(default=None)
+    investigation_perspective: Optional[TrueCrimePerspective] = Field(default=None)
+
+
+class NonFictionInfo(BaseModel):
+    """
+    Container for non-fiction-specific analysis fields.
+
+    Holds the 7 common-core fields that apply to ALL non-fiction books, plus
+    11 Optional addendum slots — exactly ONE of which is populated based on
+    the detected `sub_type`. The remaining addendum slots stay None.
+
+    Example for a self-help book:
+      NonFictionInfo(
+          thesis="...",
+          target_audience=TargetAudience.GENERAL_READER,
+          ...,
+          sub_type=BookSubType.SELF_HELP,
+          self_help=SelfHelpAddendum(skill_or_outcome="...", ...),
+          # all other addendum slots remain None
+      )
+
+    For fiction books, this entire object is None on BookAnalysis (set in A4).
+    """
+    # ── Common core (populated for ALL non-fiction books) ─────────────────
+    thesis: str = Field(
+        description="1-2 sentence statement of the book's central claim, argument, or stated purpose")
+    target_audience: TargetAudience = Field(
+        description="Who this book is for")
+    prerequisites: list[str] = Field(
+        default_factory=list,
+        description="What the reader should already know. Empty list = no prereqs needed")
+    structure_type: StructureType = Field(
+        description="How the book is organized; affects whether readers can skip around")
+    tone_register: list[ToneRegister] = Field(
+        min_length=1, max_length=3,
+        description="Writing voice (1-3 values, e.g. academic, conversational, sobering)")
+    practical_vs_theoretical: int = Field(
+        ge=1, le=10,
+        description="1=pure theory/concepts; 10=pure actionable how-to")
+    conclusion_type: ConclusionType = Field(
+        description="How the book concludes; replaces sad_ending/cliffhanger for non-fiction")
+
+    # ── Sub-type classification ───────────────────────────────────────────
+    sub_type: BookSubType = Field(
+        description="Which sub-type this book is; determines which addendum slot is populated")
+
+    # ── Addendum slots (exactly ONE populated based on sub_type) ──────────
+    # Field name matches the sub_type value (e.g. sub_type=self_help → self_help slot filled)
+    self_help: Optional[SelfHelpAddendum] = Field(default=None)
+    memoir_biography: Optional[MemoirBiographyAddendum] = Field(default=None)
+    history_narrative: Optional[HistoryNarrativeAddendum] = Field(default=None)
+    academic_textbook: Optional[AcademicTextbookAddendum] = Field(default=None)
+    popular_science: Optional[PopularScienceAddendum] = Field(default=None)
+    philosophy_religion: Optional[PhilosophyReligionAddendum] = Field(default=None)
+    business_economics: Optional[BusinessEconomicsAddendum] = Field(default=None)
+    health_fitness: Optional[HealthFitnessAddendum] = Field(default=None)
+    cooking_food: Optional[CookingFoodAddendum] = Field(default=None)
+    travel_nature: Optional[TravelNatureAddendum] = Field(default=None)
+    true_crime: Optional[TrueCrimeAddendum] = Field(default=None)
+    # Note: sub_type="other" has NO addendum slot — only common core is populated
+
+
+# ── Existing sub-models ────────────────────────────────────────────────────────
 
 class Theme(BaseModel):
     name: str = Field(description="Must be from the master theme list")
@@ -501,12 +850,11 @@ class Theme(BaseModel):
 
 class Character(BaseModel):
     name: str
-    role: str
     importance: int = Field(ge=1, le=10)
     gender: str = Field(description="male, female, non-binary, or unknown")
     archetypes: list[CharacterArchetype] = Field(min_length=1, max_length=3)
     arc_summary: str
-    age_category: Optional[str] = Field(default=None)
+    age_category: Optional[AgeCategory] = Field(default=None)
 
 class SettingInfo(BaseModel):
     primary_location: str
@@ -520,14 +868,18 @@ class HumorProfile(BaseModel):
     primary_humor_types: list[HumorType] = Field(min_length=1, max_length=3)
 
 class ContentRatings(BaseModel):
+    # ── Universal ratings (apply to both fiction and non-fiction) ─────────
     tone: int = Field(ge=1, le=10)
     readability: int = Field(ge=1, le=10)
-    violence: int = Field(ge=1, le=10)
-    age_target: int = Field(ge=1, le=10)
     pace: int = Field(ge=1, le=10)
-    worldbuilding: int = Field(ge=1, le=10)
-    humor: int = Field(ge=1, le=10)
-    romance: int = Field(ge=1, le=10)
+    age_target: int = Field(ge=1, le=10)
+    # ── Fiction-specific ratings (default to 1 for non-fiction books) ─────
+    # Non-fiction Pass 2 doesn't populate these. They default to 1
+    # (minimum) so the JSON shape stays consistent across all books.
+    violence: int = Field(default=1, ge=1, le=10)
+    worldbuilding: int = Field(default=1, ge=1, le=10)
+    humor: int = Field(default=1, ge=1, le=10)
+    romance: int = Field(default=1, ge=1, le=10)
 
 class ComputedStats(BaseModel):
     total_words: int
@@ -627,23 +979,44 @@ class BookMetadata(BaseModel):
     isbn: Optional[str] = Field(default=None)
 
 class BookAnalysis(BaseModel):
+    # ── Universal fields (apply to both fiction and non-fiction) ──────────
     metadata: BookMetadata
     themes: list[Theme]
     categories: list[str] = Field(description="Top 3 discovery tags from master list")
-    characters: list[Character]
-    setting: SettingInfo
+    setting: SettingInfo = Field(
+        default_factory=lambda: SettingInfo(
+            primary_location="",
+            time_period=TimePeriod.TIMELESS,
+            setting_type=SettingType.DOMESTIC,
+            real_or_fictional="real",
+        ),
+        description="Setting info. Real for memoirs/history/travel; minimal default for self-help/philosophy/etc.")
     ratings: ContentRatings
     computed_stats: ComputedStats
-    humor: HumorProfile
-    pov: list[POVType]
-    pov_notes: str
     reading_experience: list[ReadingExperience]
-    sad_ending: bool
-    cliffhanger: bool
-    ending_notes: str
     content_flags: list[ContentFlag]
     overall_summary: str
     analysis_version: str = Field(default="4.0.0")
+
+    # ── Fiction-specific fields (empty defaults for non-fiction) ──────────
+    # These keep JSON shape consistent across fiction/non-fiction books.
+    # Non-fiction Pass 2 doesn't populate them; they take these defaults.
+    characters: list[Character] = Field(default_factory=list)
+    humor: HumorProfile = Field(
+        default_factory=lambda: HumorProfile(
+            humor_density=1,
+            primary_humor_types=[HumorType.NONE],
+        ))
+    pov: list[POVType] = Field(default_factory=list)
+    pov_notes: str = Field(default="")
+    sad_ending: bool = Field(default=False)
+    cliffhanger: bool = Field(default=False)
+    ending_notes: str = Field(default="")
+
+    # ── Non-fiction-specific field (None for fiction books) ───────────────
+    non_fiction_info: Optional[NonFictionInfo] = Field(
+        default=None,
+        description="Populated for non-fiction books only; None for fiction.")
 
     @field_validator("themes")
     @classmethod
