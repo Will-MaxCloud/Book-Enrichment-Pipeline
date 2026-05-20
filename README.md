@@ -147,7 +147,7 @@ All rating scales are anchored to concrete book examples (e.g., tone 1 = Winnie 
 
 ## Scale and cost
 
-Current cost in `--fast` mode: roughly **$0.10–0.20 per book** (varies by length). This is not viable for processing thousands of books.
+Current cost in `--fast` mode: roughly **$0.10–0.20 per book** (varies by length). As a reference point, a 100,000-word book costs ~$0.10–0.20 and processes in roughly 80–120 seconds. This is not viable for processing thousands of books.
 
 Planned optimizations not yet implemented:
 - **Anthropic Batch API** — async processing at 50% cost reduction; suited for bulk ingestion
