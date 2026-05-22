@@ -37,8 +37,19 @@ from schemas import (
     CookingFoodAddendum, TravelNatureAddendum, TrueCrimeAddendum,
 )
 from extractor import TextChunk, ExtractionResult
+from ratelimiter import RollingRateLimiter
 
 logger = logging.getLogger(__name__)
+
+
+# Tier-1 default rate limits per model. Anthropic enforces separate buckets
+# per model, so each gets its own RollingRateLimiter instance.
+# The 90% threshold in RollingRateLimiter gives natural margin under these.
+# Override via AnalysisClient(rate_limits={...}) for higher tiers.
+_DEFAULT_RATE_LIMITS: dict[str, dict[str, int]] = {
+    "claude-haiku-4-5-20251001": {"rpm": 50, "tpm": 50_000},
+    "claude-sonnet-4-20250514":  {"rpm": 50, "tpm": 30_000},
+}
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -252,27 +263,22 @@ JSON:"""
 class AnalysisClient:
     def __init__(self, api_key, model="claude-sonnet-4-20250514",
                  p2_model=None, max_retries=3, retry_delay=2.0,
-                 pace_threshold_tokens=10_000, pace_sleep_seconds=8.0,
-                 detection_model="claude-haiku-4-5-20251001"):
+                 detection_model="claude-haiku-4-5-20251001",
+                 rate_limits: dict | None = None):
         """
         Args:
-            pace_threshold_tokens: only pace after calls that used MORE than
-                                   this many input tokens. Smaller calls fly
-                                   through with no extra delay.
-            pace_sleep_seconds: target gap between large calls. The actual
-                                sleep is reduced by however much wall-clock
-                                time has already passed since the last call,
-                                so this is a *minimum gap*, not an *added*
-                                delay.
             detection_model: model used for the cheap fiction/non-fiction
                              pre-classification call. Defaults to Haiku
                              regardless of Pass 1/2 model choice — detection
                              is a simple binary task that doesn't need Sonnet.
+            rate_limits: optional override of per-model {rpm, tpm} dict.
+                         Defaults to _DEFAULT_RATE_LIMITS (Tier 1). Pass
+                         e.g. {"claude-haiku-4-5-20251001": {"rpm": 100, "tpm": 100_000}}
+                         to raise limits for a higher tier.
 
-        The pacer protects against the rate-limit burst pattern that occurs
-        when several large chunks fire in quick succession. Small calls
-        don't need pacing because they don't burst hard enough to trip
-        Anthropic's token bucket.
+        Rate limiting is enforced by RollingRateLimiter (sliding 60s window,
+        90% safety threshold, per-model bucket). The 429 retry block below
+        remains as a safety net but should rarely fire under normal load.
         """
         self.api_key = api_key
         self.model = model
@@ -281,13 +287,9 @@ class AnalysisClient:
         self.max_retries, self.retry_delay = max_retries, retry_delay
         self._profiler = None  # optional Profiler instance; see attach_profiler()
 
-        # ── Lightweight pacer (sequential / single-threaded) ──────────────
-        # Tracks the most recent call's input_tokens and timestamp. Used
-        # to enforce a minimum gap between large back-to-back calls.
-        self.pace_threshold_tokens = pace_threshold_tokens
-        self.pace_sleep_seconds = pace_sleep_seconds
-        self._last_call_ts: float = 0.0
-        self._last_call_tokens: int = 0
+        # ── Per-model rate limiters (lazy-created in _get_limiter) ────────
+        self._rate_limits = rate_limits or _DEFAULT_RATE_LIMITS
+        self._limiters: dict[str, RollingRateLimiter] = {}
 
     def attach_profiler(self, profiler) -> None:
         """
@@ -296,41 +298,25 @@ class AnalysisClient:
         """
         self._profiler = profiler
 
-    def _pace_for_request(self) -> None:
-        """
-        Sleep briefly if the previous call was large, to avoid bursting
-        the API's rate limiter.
-
-        Rule: if the last call used MORE than pace_threshold_tokens of
-        input, ensure at least pace_sleep_seconds has elapsed before the
-        next call. Otherwise fly through with no extra delay.
-
-        The actual sleep is shortened by however much wall-clock time has
-        already passed (e.g. from the small inter-chunk sleep in
-        run_analysis.py), so we never sleep more than necessary.
-
-        If our heuristic is wrong, the existing 429 retry handler in
-        _call_api still catches it as a safety net.
-        """
-        if self._last_call_tokens <= self.pace_threshold_tokens:
-            return  # Last call was small — no pacing needed
-
-        elapsed = time.time() - self._last_call_ts
-        remaining = self.pace_sleep_seconds - elapsed
-        if remaining <= 0:
-            return  # Enough time has already passed naturally
-
-        logger.info(f"  [pacer] last call was {self._last_call_tokens:,} tok; "
-                    f"sleeping {remaining:.1f}s before next call")
-        time.sleep(remaining)
+    def _get_limiter(self, model: str) -> RollingRateLimiter:
+        """Return (and lazily create) the rate limiter for a given model."""
+        if model not in self._limiters:
+            # Unknown models fall back to conservative Sonnet-tier limits.
+            cfg = self._rate_limits.get(model, {"rpm": 50, "tpm": 30_000})
+            self._limiters[model] = RollingRateLimiter(
+                rpm_limit=cfg["rpm"], tpm_limit=cfg["tpm"])
+        return self._limiters[model]
 
     def _call_api(self, prompt, max_tokens=4096, model_override=None, tag="untagged"):
         import anthropic
         client = anthropic.Anthropic(api_key=self.api_key)
         use_model = model_override or self.model
 
-        # Pace before each request based on the previous call's size.
-        self._pace_for_request()
+        # Pre-emptive rate limiting (per-model bucket, 90% safety threshold).
+        # Estimate input tokens from prompt length conservatively (~3 chars/tok).
+        # The estimate slightly over-counts for English, which keeps us safe.
+        estimated_input = max(len(prompt) // 3, 100)
+        self._get_limiter(use_model).wait_if_needed(estimated_input)
 
         for attempt in range(1, self.max_retries + 1):
             try:
@@ -338,10 +324,6 @@ class AnalysisClient:
                 r = client.messages.create(
                     model=use_model, max_tokens=max_tokens, temperature=0.0,
                     messages=[{"role": "user", "content": prompt}])
-
-                # Record this call's size and timestamp for the next pace check.
-                self._last_call_ts = call_start
-                self._last_call_tokens = r.usage.input_tokens
 
                 # Profiler hook — only runs if attached. Defensive: any failure
                 # here is silently swallowed so profiling can never break a run.
@@ -358,7 +340,7 @@ class AnalysisClient:
                         logger.warning(f"Profiler record failed (ignored): {e}")
                 return "".join(b.text for b in r.content if b.type == "text").strip()
             except anthropic.RateLimitError:
-                # Pacer didn't catch it — fall back to the API's suggested wait.
+                # Limiter under-estimated — fall back to backoff retry.
                 w = self.retry_delay * (2 ** (attempt - 1))
                 logger.warning(f"Rate limited — {w:.1f}s (attempt {attempt})")
                 time.sleep(w)
@@ -2243,11 +2225,30 @@ def _build_nonfic_holistic_prompt(pass1_analyses, extraction):
     """
     # Build a compact chapter spine: label + summary per chunk
     chunk_spine_lines = []
+    char_freq: dict[str, dict] = {}  # lowercase name → {"name": original, "count": int}
     for sa in pass1_analyses:
         label = getattr(sa, "label", None) or getattr(sa, "chunk_label", "?")
         summary = getattr(sa, "summary", "") or ""
         chunk_spine_lines.append(f"- {label}: {summary[:300]}")
+        # Aggregate character names across chunks (works for SlimChunkAnalysis
+        # and ChunkAnalysis — fall back to characters_present in quality mode).
+        names = getattr(sa, "character_names", None)
+        if names is None:
+            present = getattr(sa, "characters_present", []) or []
+            names = [getattr(c, "name", "") for c in present]
+        for n in (names or []):
+            if isinstance(n, str) and n.strip():
+                key = n.lower().strip()
+                if key not in char_freq:
+                    char_freq[key] = {"name": n.strip(), "count": 0}
+                char_freq[key]["count"] += 1
     chunk_spine = "\n".join(chunk_spine_lines[:60])  # cap at 60 chapters for safety
+
+    # Top character candidates (memoir/biography/history will use these;
+    # cookbook/self-help/business prompt is told to return empty).
+    top_chars = sorted(char_freq.values(), key=lambda x: x["count"], reverse=True)[:15]
+    char_names_str = ", ".join(f'"{c["name"]}"' for c in top_chars) or "(none detected)"
+    arch_values = ", ".join(f'"{a.value}"' for a in CharacterArchetype)
 
     # Compact metadata header
     title = getattr(extraction, "title", "") or "(unknown title)"
@@ -2324,6 +2325,8 @@ CLOSING SAMPLE:
 Fill in this JSON. Use exact canonical values for enum fields.
 
 {{
+  "title": "the book's title (use the BOOK header above if you can't infer better)",
+  "author": "the book's author (use the BOOK header above if you can't infer better)",
   "thesis": "1-2 sentence statement of the book's central argument, claim, or stated purpose. Different from a summary — this is what the author wants the reader to take away.",
   "target_audience": "pick one from: {audiences}",
   "prerequisites": ["list of things readers should know first — empty list if none required"],
@@ -2358,9 +2361,35 @@ Fill in this JSON. Use exact canonical values for enum fields.
     "real_or_fictional": "always 'real' for non-fiction",
     "additional_locations": []
   }},
-  "age_target": <int 1-10, where 10 is most appropriate for very young readers, 1 is most adult>,
-  "overall_summary": "2-3 sentence factual summary of what the book covers."
+  "age_target": <int 1-10, using the standard rubric: 1=very young (Goodnight Moon), 5=YA/adult (Hunger Games), 10=mature adult (A Little Life). For non-fiction: 1-3 = picture books / children's non-fic, 4-6 = general adult reader, 7-10 = mature/explicit content, trauma memoirs, graphic histories. Higher = more mature.>,
+  "overall_summary": "2-3 sentence factual summary of what the book covers.",
+
+  "ranked_characters": ["top 8 named PEOPLE by overall importance to this book. ONLY fill for memoir_biography, history_narrative, true_crime, or other character-driven non-fiction. Return [] for self_help, business_economics, cooking_food, philosophy_religion, popular_science, academic_textbook, health_fitness, travel_nature (no real characters to rank)."],
+  "character_arcs": {{
+    "PersonName": "1-3 sentence summary of this person's role/journey/significance in the book. Only fill when ranked_characters is non-empty."
+  }},
+  "character_genders": {{
+    "PersonName": "male|female|non-binary|unknown"
+  }},
+  "character_archetypes": {{
+    "PersonName": ["1-3 archetypes from: {arch_values}"]
+  }},
+  "character_ages": {{
+    "PersonName": "child|teen|young_adult|adult|elderly|ageless|null"
+  }}
 }}
+
+GUIDELINES — CHARACTER FIELDS (memoir/biography/history/true_crime ONLY):
+- Pass 1 detected these candidate names: [{char_names_str}]
+- ranked_characters: pick the TOP 8 most important real people, ranked by significance to the book.
+  - Memoir/autobiography: the author/narrator is usually #1.
+  - Biography: the subject is #1.
+  - For OTHER non-fiction sub_types (cookbook, self-help, business, etc.), return [] —
+    those books have no real "characters" in this sense.
+- Use the EXACT names from the candidate list (or canonical full names if ambiguous).
+- character_arcs / character_genders / character_archetypes / character_ages must have
+  one entry per name in ranked_characters. Leave as {{}} if ranked_characters is [].
+- Each arc must be 1-3 real sentences. Never empty or generic.
 
 GUIDELINES — NON-FICTION-SPECIFIC FIELDS:
 - thesis: be specific. "About productivity" is bad; "Habits are formed by repeating small actions consistently over time" is good.
@@ -2465,8 +2494,9 @@ GUIDELINES — UNIVERSAL FIELDS:
   time_period="late_20th_century", setting_type="urban"). For SELF-HELP, PHILOSOPHY,
   BUSINESS, COOKING, HEALTH — use defaults (primary_location="",
   time_period="timeless_or_unspecified", setting_type="domestic").
-- age_target: 10 = picture books / very young; 7-9 = general adult reader; 5-6 = teen+;
-  1-4 = mature/explicit content only.
+- age_target: STANDARD scale — 1=very young readers (Goodnight Moon), 5=teen/YA (Hunger Games),
+  10=mature adult (A Little Life). For non-fic: 1-3 = children's non-fic; 4-6 = general adult;
+  7-10 = mature content (trauma memoirs, graphic histories, explicit material). HIGHER = MORE MATURE.
 - content_flags: apply to non-fiction too. War histories have violence flags;
   trauma memoirs have abuse/death; medical books may have explicit_health_content.
 - overall_summary: factual, NOT marketing copy. 2-3 sentences.
@@ -2828,11 +2858,12 @@ def _sanitize_nonfic_universal_data(data, extraction):
         data = {}
     data = dict(data)
 
-    # title / author — fall back to extraction metadata if missing
+    # title / author — fall back to extraction metadata if missing.
+    # ExtractionResult uses title_guess / author_guess (not title / author).
     if not isinstance(data.get("title"), str) or not data.get("title", "").strip():
-        data["title"] = getattr(extraction, "title", "") or "Unknown Title"
+        data["title"] = getattr(extraction, "title_guess", "") or "Unknown Title"
     if not isinstance(data.get("author"), str) or not data.get("author", "").strip():
-        data["author"] = getattr(extraction, "author", "") or "Unknown Author"
+        data["author"] = getattr(extraction, "author_guess", "") or "Unknown Author"
 
     # book_type: always non_fiction (we know this from detection)
     data["book_type"] = "non_fiction"
@@ -2931,22 +2962,53 @@ def _sanitize_nonfic_universal_data(data, extraction):
     else:
         data["overall_summary"] = data["overall_summary"].strip()[:2000]
 
-    # ── Fiction-only fields that HolisticAnalysis still requires — fill empty ──
+    # ── Fiction-only narrative fields: still empty for non-fic ────────────
     # These are present in the HolisticAnalysis schema but irrelevant for non-fic.
-    # We populate with minimal valid defaults so HolisticAnalysis(**data) validates.
-    # Use enum .value references (not raw strings) so a typo would fail at import
-    # time rather than at runtime when the model tries to validate.
+    # Use enum .value references so a typo would fail at import time.
     data["pov_types"] = [POVType.THIRD_PERSON_LIMITED.value]  # arbitrary valid; downstream ignores
     data["pov_notes"] = ""
     data["sad_ending"] = False
     data["cliffhanger"] = False
     data["ending_notes"] = ""
-    data["character_arcs"] = {}
-    data["character_genders"] = {}
-    data["character_archetypes"] = {}
-    data["character_ages"] = {}
-    data["ranked_characters"] = []
     data["humor_types"] = [HumorType.NONE.value]
+
+    # ── Character fields: relevant for memoir/biography/history/true_crime ──
+    # Sanitize whatever the model returned (memoirs will fill these; cookbooks
+    # / self-help / business return empty). Mirrors _sanitize_holistic_data.
+    if not isinstance(data.get("character_arcs"), dict):
+        data["character_arcs"] = {}
+    if not isinstance(data.get("character_genders"), dict):
+        data["character_genders"] = {}
+
+    if not isinstance(data.get("character_archetypes"), dict):
+        data["character_archetypes"] = {}
+    else:
+        sanitized_archetypes = {}
+        for char_name, archs in data["character_archetypes"].items():
+            if isinstance(archs, list):
+                sanitized_archetypes[char_name] = _sanitize_enum_list(
+                    archs, _VALID_ARCH, _ARCH_MAP, "other")[:3]
+            elif isinstance(archs, str):
+                sanitized_archetypes[char_name] = _sanitize_enum_list(
+                    [archs], _VALID_ARCH, _ARCH_MAP, "other")[:3]
+            else:
+                sanitized_archetypes[char_name] = ["other"]
+        data["character_archetypes"] = sanitized_archetypes
+
+    if not isinstance(data.get("character_ages"), dict):
+        data["character_ages"] = {}
+    else:
+        sanitized_ages = {}
+        for char_name, age_val in data["character_ages"].items():
+            if isinstance(char_name, str) and char_name.strip():
+                sanitized_ages[char_name.strip()] = _sanitize_age(age_val)
+        data["character_ages"] = sanitized_ages
+
+    if isinstance(data.get("ranked_characters"), list):
+        data["ranked_characters"] = [c.strip() for c in data["ranked_characters"]
+                                      if isinstance(c, str) and c.strip()][:8]
+    else:
+        data["ranked_characters"] = []
 
     # Strip keys not in HolisticAnalysis schema so **data splat doesn't choke
     allowed = {

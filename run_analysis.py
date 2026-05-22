@@ -278,10 +278,19 @@ def _run_fast_pipeline(client, extraction, book_context, profiler=None):
 
     # (Detection already happened before Pass 1 — book_type is in scope.)
 
-    logger.info("STEP 3/4 · Pass 2 [FAST → SONNET]: Full analysis...")
-    if profiler: profiler.start_stage("pass2")
-    holistic = client.analyze_holistic_fast(slim_analyses, extraction)
-    if profiler: profiler.end_stage("pass2")
+    # ── Pass 2: unified for non-fiction, fiction-only otherwise ─────────
+    nfi = None
+    if book_type == "non_fiction":
+        logger.info("STEP 3/4 · Pass 2 [FAST → SONNET]: Unified non-fiction analysis...")
+        if profiler: profiler.start_stage("pass2")
+        holistic, nfi = client.analyze_holistic_nonfic_full(slim_analyses, extraction)
+        if profiler: profiler.end_stage("pass2")
+    else:
+        logger.info("STEP 3/4 · Pass 2 [FAST → SONNET]: Full analysis...")
+        if profiler: profiler.start_stage("pass2")
+        holistic = client.analyze_holistic_fast(slim_analyses, extraction)
+        if profiler: profiler.end_stage("pass2")
+
     logger.info(f"  → Genre: {holistic.genre.value}")
     logger.info(f"  → Themes: {len(holistic.ranked_themes)}")
     logger.info(f"  → Characters: {len(holistic.ranked_characters)}")
@@ -291,16 +300,8 @@ def _run_fast_pipeline(client, extraction, book_context, profiler=None):
     result = aggregate_analysis_fast(slim_analyses, holistic, extraction)
     if profiler: profiler.end_stage("aggregation")
 
-    # ── Non-fiction Pass 2 (Session C): populate NonFictionInfo ──────────
-    # For non-fiction books, attach a placeholder NonFictionInfo so the
-    # BookAnalysis JSON has the field populated. Session C replaces the
-    # stub with a real Pass 2 prompt result.
-    if book_type == "non_fiction":
-        if profiler: profiler.start_stage("p2_nonfic")
-        logger.info(f"  [non-fic] Running non-fiction Pass 2...")
-        result.non_fiction_info = client.analyze_holistic_nonfic(slim_analyses, extraction)
-        if profiler: profiler.end_stage("p2_nonfic")
-        nfi = result.non_fiction_info
+    if book_type == "non_fiction" and nfi is not None:
+        result.non_fiction_info = nfi
         logger.info(f"  [non-fic] Sub-type: {nfi.sub_type.value}, audience: {nfi.target_audience.value}, structure: {nfi.structure_type.value}")
         logger.info(f"  [non-fic] Thesis: {nfi.thesis[:80]}...")
 
@@ -309,7 +310,6 @@ def _run_fast_pipeline(client, extraction, book_context, profiler=None):
         # Fixes a structural issue where mention-counting alone ranks people
         # the author talks ABOUT above the author themselves.
         result = promote_memoir_protagonist(result, extraction)
-
 
     return result
 
@@ -359,14 +359,23 @@ def _run_faster_pipeline(client, extraction, book_context, profiler=None):
 
     # (Detection already happened before Pass 1 — book_type is in scope.)
 
-    # ── Branch by book type (Session D) ───────────────────────────────────
-    logger.info("STEP 3/4 · Pass 2 [FASTER → HAIKU]: Full analysis...")
-    if profiler: profiler.start_stage("pass2")
-    # Bump max_tokens generously — Haiku output is cheap and we want headroom
-    # for the full structured JSON (themes, characters, arcs, genders, archetypes,
-    # ages, content flags, summary, etc.) without truncation.
-    holistic = client.analyze_holistic_fast(slim_analyses, extraction, p2_max_tokens=8192)
-    if profiler: profiler.end_stage("pass2")
+    # ── Pass 2: unified for non-fiction, fiction-only otherwise ─────────
+    # Bump max_tokens for Haiku output — full structured JSON (themes,
+    # characters, arcs, genders, archetypes, ages, content flags, summary,
+    # etc.) needs headroom on Haiku.
+    nfi = None
+    if book_type == "non_fiction":
+        logger.info("STEP 3/4 · Pass 2 [FASTER → HAIKU]: Unified non-fiction analysis...")
+        if profiler: profiler.start_stage("pass2")
+        holistic, nfi = client.analyze_holistic_nonfic_full(
+            slim_analyses, extraction, p2_max_tokens=8192)
+        if profiler: profiler.end_stage("pass2")
+    else:
+        logger.info("STEP 3/4 · Pass 2 [FASTER → HAIKU]: Full analysis...")
+        if profiler: profiler.start_stage("pass2")
+        holistic = client.analyze_holistic_fast(slim_analyses, extraction, p2_max_tokens=8192)
+        if profiler: profiler.end_stage("pass2")
+
     logger.info(f"  → Genre: {holistic.genre.value}")
     logger.info(f"  → Themes: {len(holistic.ranked_themes)}")
     logger.info(f"  → Characters: {len(holistic.ranked_characters)}")
@@ -376,22 +385,11 @@ def _run_faster_pipeline(client, extraction, book_context, profiler=None):
     result = aggregate_analysis_fast(slim_analyses, holistic, extraction)
     if profiler: profiler.end_stage("aggregation")
 
-    # ── Non-fiction Pass 2 (Session C): populate NonFictionInfo ──────────
-    if book_type == "non_fiction":
-        if profiler: profiler.start_stage("p2_nonfic")
-        logger.info(f"  [non-fic] Running non-fiction Pass 2...")
-        result.non_fiction_info = client.analyze_holistic_nonfic(slim_analyses, extraction)
-        if profiler: profiler.end_stage("p2_nonfic")
-        nfi = result.non_fiction_info
+    if book_type == "non_fiction" and nfi is not None:
+        result.non_fiction_info = nfi
         logger.info(f"  [non-fic] Sub-type: {nfi.sub_type.value}, audience: {nfi.target_audience.value}, structure: {nfi.structure_type.value}")
         logger.info(f"  [non-fic] Thesis: {nfi.thesis[:80]}...")
-
-        # If this is a first-person memoir/autobiography, ensure the author
-        # (= the first-person narrator) is ranked as the primary character.
-        # Fixes a structural issue where mention-counting alone ranks people
-        # the author talks ABOUT above the author themselves.
         result = promote_memoir_protagonist(result, extraction)
-
 
     return result
 

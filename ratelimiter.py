@@ -1,64 +1,101 @@
 """
-Rolling-window rate limiter for Anthropic API calls.
-Tracks RPM and TPM in a 60-second window and pre-emptively throttles
-before hitting limits — preventing 429 errors rather than recovering from them.
+Token-bucket rate limiter matching Anthropic's algorithm.
+
+Anthropic enforces rate limits via a token bucket: capacity refills continuously
+at limit/60 per second up to the maximum. Bursts up to the bucket size are
+allowed; sustained rates above limit/60-per-second are throttled.
+
+A sliding-window limiter is too conservative here — it counts burst tokens
+against the limit for a full 60s, throttling well below what the API actually
+allows. This token-bucket implementation matches the API's behavior, so we
+get full throughput without 429s.
+
 Thread-safe for concurrent chunk processing.
 """
 
 from __future__ import annotations
 import time
 import threading
-from collections import deque
 
 
 class RollingRateLimiter:
     """
-    Sliding 60-second window rate limiter.
+    Token-bucket rate limiter with separate RPM and TPM buckets.
 
-    Call wait_if_needed(estimated_tokens) before every API request.
-    Blocks until both RPM and TPM have headroom (90% threshold).
-    Thread-safe: a lock ensures concurrent callers queue correctly.
+    Both buckets start full and refill at (limit / 60) per second. A request
+    is admitted when BOTH buckets have headroom for it. If a bucket is empty,
+    the caller blocks until enough refill has occurred.
+
+    The class name is kept as RollingRateLimiter for backward compatibility
+    with existing imports; the algorithm is now token bucket, not sliding
+    window.
+
+    Args:
+        rpm_limit: Requests-per-minute ceiling per Anthropic's docs.
+        tpm_limit: Tokens-per-minute ceiling (input tokens for most models).
+        safety_margin: Fraction of the published limit to use as the bucket
+                       size (default 0.95). Provides headroom for clock skew
+                       between our timing and Anthropic's, and for tokens
+                       still in flight that haven't been billed yet.
     """
 
-    def __init__(self, rpm_limit: int = 50, tpm_limit: int = 50_000):
-        self.rpm_limit = rpm_limit
-        self.tpm_limit = tpm_limit
-        self._window = 60.0
-        self._threshold = 0.90          # slow down at 90% of limit
-        self._lock = threading.Lock()
-        self._requests: deque[float] = deque()           # timestamps
-        self._tokens: deque[tuple[float, int]] = deque() # (timestamp, count)
+    def __init__(self, rpm_limit: int = 50, tpm_limit: int = 50_000,
+                 safety_margin: float = 0.95):
+        self.rpm_limit = rpm_limit * safety_margin
+        self.tpm_limit = tpm_limit * safety_margin
+        # Refill rate per second matches the ceiling/60 (Anthropic's algorithm).
+        self.rpm_refill_per_sec = self.rpm_limit / 60.0
+        self.tpm_refill_per_sec = self.tpm_limit / 60.0
 
-    def _prune(self, now: float) -> None:
-        cutoff = now - self._window
-        while self._requests and self._requests[0] <= cutoff:
-            self._requests.popleft()
-        while self._tokens and self._tokens[0][0] <= cutoff:
-            self._tokens.popleft()
+        self._lock = threading.Lock()
+        self._rpm_bucket = float(self.rpm_limit)   # start full
+        self._tpm_bucket = float(self.tpm_limit)   # start full
+        self._last_refill = time.monotonic()
+
+    def _refill(self, now: float) -> None:
+        """Add tokens to both buckets based on time since last refill."""
+        elapsed = now - self._last_refill
+        if elapsed <= 0:
+            return
+        self._rpm_bucket = min(
+            self.rpm_limit,
+            self._rpm_bucket + elapsed * self.rpm_refill_per_sec)
+        self._tpm_bucket = min(
+            self.tpm_limit,
+            self._tpm_bucket + elapsed * self.tpm_refill_per_sec)
+        self._last_refill = now
 
     def wait_if_needed(self, estimated_tokens: int) -> None:
-        """Block until both RPM and TPM windows have headroom, then reserve a slot."""
+        """
+        Block until both buckets have headroom for the request, then deduct.
+
+        Args:
+            estimated_tokens: Caller's best estimate of input tokens this
+                              request will use. Slight over-estimation is
+                              safer than under-estimation (under-estimating
+                              risks a 429; over-estimating just adds a tiny
+                              delay).
+        """
         while True:
             with self._lock:
                 now = time.monotonic()
-                self._prune(now)
+                self._refill(now)
 
-                current_rpm = len(self._requests)
-                current_tpm = sum(n for _, n in self._tokens)
-
-                rpm_ok = current_rpm < self.rpm_limit * self._threshold
-                tpm_ok = (current_tpm + estimated_tokens) < self.tpm_limit * self._threshold
-
-                if rpm_ok and tpm_ok:
-                    self._requests.append(now)
-                    self._tokens.append((now, estimated_tokens))
+                if self._rpm_bucket >= 1.0 and self._tpm_bucket >= estimated_tokens:
+                    self._rpm_bucket -= 1.0
+                    self._tpm_bucket -= estimated_tokens
                     return
 
-                # Calculate minimum sleep until the oldest entry ages out
-                sleep_s = 1.0
-                if not rpm_ok and self._requests:
-                    sleep_s = max(sleep_s, self._window - (now - self._requests[0]))
-                if not tpm_ok and self._tokens:
-                    sleep_s = max(sleep_s, self._window - (now - self._tokens[0][0]))
+                # Compute the minimum wait until BOTH buckets have headroom.
+                rpm_wait = 0.0
+                if self._rpm_bucket < 1.0:
+                    rpm_wait = (1.0 - self._rpm_bucket) / self.rpm_refill_per_sec
+                tpm_wait = 0.0
+                if self._tpm_bucket < estimated_tokens:
+                    tpm_wait = (estimated_tokens - self._tpm_bucket) / self.tpm_refill_per_sec
+                # Floor at 100ms so we don't busy-spin on tiny waits.
+                sleep_s = max(rpm_wait, tpm_wait, 0.1)
 
+            # Sleep outside the lock so other threads can refill check.
+            # Cap individual sleeps at 5s so we re-check the bucket regularly.
             time.sleep(min(sleep_s, 5.0))
