@@ -307,34 +307,63 @@ class AnalysisClient:
                 rpm_limit=cfg["rpm"], tpm_limit=cfg["tpm"])
         return self._limiters[model]
 
-    def _call_api(self, prompt, max_tokens=4096, model_override=None, tag="untagged"):
+    def _call_api(self, prompt, max_tokens=4096, model_override=None,
+                  tag="untagged", system=None):
+        """Send a Messages API call with optional cached system content.
+
+        Args:
+            prompt: user message text (per-chunk dynamic content)
+            system: optional system content. Either a string or a list of
+                    content blocks (use the block form with cache_control
+                    markers for prompt caching). On cache hits, the cached
+                    tokens do NOT count against ITPM rate limits, which
+                    expands effective throughput.
+        """
         import anthropic
         client = anthropic.Anthropic(api_key=self.api_key)
         use_model = model_override or self.model
 
-        # Pre-emptive rate limiting (per-model bucket, 90% safety threshold).
-        # Estimate input tokens from prompt length conservatively (~3 chars/tok).
-        # The estimate slightly over-counts for English, which keeps us safe.
-        estimated_input = max(len(prompt) // 3, 100)
+        # Pre-emptive rate limiting (per-model bucket, 95% safety threshold).
+        # Estimate input tokens conservatively (~3 chars/tok over-counts
+        # slightly for English, keeping us safe under the bucket).
+        # On cache hits the limiter over-throttles by the cached size — this
+        # is acceptable since alternative is risking 429s.
+        prompt_chars = len(prompt)
+        if system is not None:
+            if isinstance(system, str):
+                prompt_chars += len(system)
+            else:
+                for block in system:
+                    prompt_chars += len(block.get("text", ""))
+        estimated_input = max(prompt_chars // 3, 100)
         self._get_limiter(use_model).wait_if_needed(estimated_input)
 
         for attempt in range(1, self.max_retries + 1):
             try:
                 call_start = time.time()
-                r = client.messages.create(
-                    model=use_model, max_tokens=max_tokens, temperature=0.0,
-                    messages=[{"role": "user", "content": prompt}])
+                kwargs = {
+                    "model": use_model, "max_tokens": max_tokens,
+                    "temperature": 0.0,
+                    "messages": [{"role": "user", "content": prompt}],
+                }
+                if system is not None:
+                    kwargs["system"] = system
+                r = client.messages.create(**kwargs)
 
                 # Profiler hook — only runs if attached. Defensive: any failure
                 # here is silently swallowed so profiling can never break a run.
                 if self._profiler is not None:
                     try:
+                        cache_creation = getattr(r.usage, "cache_creation_input_tokens", 0) or 0
+                        cache_read = getattr(r.usage, "cache_read_input_tokens", 0) or 0
                         self._profiler.record_call(
                             tag=tag, model=use_model,
                             input_tokens=r.usage.input_tokens,
                             output_tokens=r.usage.output_tokens,
                             latency_seconds=time.time() - call_start,
                             timestamp=call_start,
+                            cache_creation_tokens=cache_creation,
+                            cache_read_tokens=cache_read,
                         )
                     except Exception as e:
                         logger.warning(f"Profiler record failed (ignored): {e}")
@@ -2063,6 +2092,11 @@ def _build_slim_chunk_prompt(chunk, book_context, book_type="fiction"):
     Branches on book_type so non-fiction (memoirs, biographies, history) gets
     correct guidance: real people ARE the characters in a memoir, and the
     first-person narrator IS the author/subject.
+
+    Returns the prompt as a single string. (The cached system-block variant
+    was tried and reverted: Haiku 4.5 requires ≥4,096 cacheable tokens, but
+    the slim prompt is ~700 tokens. Padding to clear the threshold added
+    cost without caching benefit AND shifted ratings away from baseline.)
     """
     flag_values = ", ".join(f'"{f.value}"' for f in ContentFlag)
 
